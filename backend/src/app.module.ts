@@ -1,0 +1,60 @@
+import { Module } from '@nestjs/common';
+import { TypeOrmModule } from '@nestjs/typeorm';
+import { AppController } from './app.controller';
+import { AppService } from './app.service';
+import { LeadsModule } from './leads/leads.module';
+import { TenantsModule } from './tenants/tenants.module';
+import { OpportunitiesModule } from './opportunities/opportunities.module';
+import { CnaesModule } from './cnaes/cnaes.module';
+import { EmpresasModule } from './empresas/empresas.module';
+import { EstabelecimentosModule } from './estabelecimentos/estabelecimentos.module';
+import { MotivosModule } from './motivos/motivos.module';
+import { MunicipiosModule } from './municipios/municipios.module';
+import { NaturezasModule } from './naturezas/naturezas.module';
+import { PaisesModule } from './paises/paises.module';
+import { QualificacoesModule } from './qualificacoes/qualificacoes.module';
+import { StatsModule } from './stats/stats.module';
+import { CnpjsModule } from './cnpjs/cnpjs.module';
+import { SharedModule } from './shared/shared.module';
+import { BasePrimariaModule } from './base-primaria/base-primaria.module';
+import { RecortesModule } from './recortes/recortes.module';
+import { ImpactosModule } from './impactos/impactos.module';
+import { EnriquecimentoModule } from './enriquecimento/enriquecimento.module';
+import { AiModule } from './ai/ai.module';
+
+@Module({
+  imports: [
+    TypeOrmModule.forRoot({
+      type: 'postgres',
+      host: '127.0.0.1',
+      port: 5432,
+      username: 'pie',
+      password: 'pie',
+      database: 'pie',
+      autoLoadEntities: true,
+      synchronize: true,
+    }),
+    LeadsModule,
+    TenantsModule,
+    OpportunitiesModule,
+    CnaesModule,
+    EmpresasModule,
+    EstabelecimentosModule,
+    MotivosModule,
+    MunicipiosModule,
+    NaturezasModule,
+    PaisesModule,
+    QualificacoesModule,
+    StatsModule,
+    CnpjsModule,
+    SharedModule,
+    BasePrimariaModule,
+    RecortesModule,
+    ImpactosModule,
+    EnriquecimentoModule,
+    AiModule,
+  ],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}

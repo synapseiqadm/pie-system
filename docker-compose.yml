@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    command: npm run dev
+
+  backend:
+    build: ./backend
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./backend:/app
+
+  db:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: pie
+      POSTGRES_PASSWORD: pie
+      POSTGRES_DB: pie
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pie_pgdata:/var/lib/postgresql/data
+
+volumes:
+  pie_pgdata:

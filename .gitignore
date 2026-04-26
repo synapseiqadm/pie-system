@@ -1,0 +1,41 @@
+# Dependências
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js build
+.next/
+out/
+
+# NestJS build
+dist/
+node_modules/
+
+# Variáveis de ambiente (IMPORTANTE: nunca suba isso!)
+.env
+.env.local
+.env.*.local
+
+# Docker e Banco de Dados (Postgres)
+# Se você mapeou o volume do Postgres para uma pasta local, ignore-a:
+pgdata/
+postgres_data/
+
+# DuckDB e Parquet
+*.db
+*.duckdb
+*.wal
+
+# Dados brutos da Receita Federal (gigabytes — não versionados)
+data/
+
+# Configurações locais do Claude
+.claude/settings.local.json
+
+# Ferramentas de sistema e IDEs
+.DS_Store
+.vscode/
+.idea/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*

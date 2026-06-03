@@ -69,7 +69,12 @@ export class AiService {
     const temMunis = municipiosCandidatos.length > 0;
 
     const cnaeBloco = temCnaes
-      ? `CNAEs encontrados na base para este perfil (use preferencialmente estes):\n${cnaesCandidatos.map(c => `${c.codigo} - ${c.descricao}`).join('\n')}`
+      ? `CNAEs encontrados na base (ponto de partida — complemente com seu conhecimento):\n${cnaesCandidatos.map(c => `${c.codigo} - ${c.descricao}`).join('\n')}
+
+Use estes CNAEs como base, mas adicione todos os outros relevantes que você conhece da tabela CNAE brasileira:
+- Inclua variantes do mesmo setor (ex: para farmácias: 4771701, 4771702, 4771703, 4771704)
+- Inclua atacado, varejo e serviços relacionados quando aplicável
+- Retorne de 5 a 15 CNAEs no total; formato obrigatório: exatamente 7 dígitos sem pontos/hífens/barras`
       : `Nenhum CNAE foi pré-filtrado pelo banco. Use seu conhecimento completo da tabela CNAE brasileira.
 Você conhece bem a tabela — mapeie o setor descrito para todos os CNAEs relevantes:
 - Inclua fabricação, comércio (atacado e varejo) E serviços quando aplicável ao setor

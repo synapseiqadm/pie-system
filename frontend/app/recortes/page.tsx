@@ -3,7 +3,7 @@
 import { useEffect, useState, useCallback, useRef, type CSSProperties } from 'react';
 import { useRouter } from 'next/navigation';
 
-const API = 'http://localhost:3001';
+const API = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

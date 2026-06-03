@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useRef } from 'react';
 
-const API_URL = 'http://localhost:3001';
+const API_URL = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
 type Row = { id: number; codigo: string; descricao: string };
 

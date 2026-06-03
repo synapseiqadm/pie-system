@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation';
 import type { Job } from '../enriquecimento/page';
 import { ENRICHMENT_COLORS } from '../enriquecimento/page';
 
-const API           = 'http://localhost:3001';
+const API           = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 const STORAGE_KEY   = 'pie_enrichment_jobs';
 const SCORE_STORAGE = 'pie_lead_scores';
 

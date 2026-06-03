@@ -29,7 +29,7 @@ import { AiModule } from './ai/ai.module';
       url: process.env.DATABASE_URL ?? 'postgresql://pie:pie@127.0.0.1:5432/pie',
       ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
       autoLoadEntities: true,
-      synchronize: process.env.NODE_ENV !== 'production',
+      synchronize: true,
     }),
     LeadsModule,
     TenantsModule,

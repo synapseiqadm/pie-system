@@ -28,6 +28,7 @@ import { AiModule } from './ai/ai.module';
       type: 'postgres',
       url: process.env.DATABASE_URL ?? 'postgresql://pie:pie@127.0.0.1:5432/pie',
       ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+      schema: 'public',
       autoLoadEntities: true,
       synchronize: true,
     }),

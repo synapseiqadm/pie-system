@@ -178,20 +178,35 @@ Máximo 5 domínios. Não inclua provedores genéricos de hospedagem.`;
     descricao: string,
     nome: string,
     cnpj: string,
+    opts: { uf?: string; cnae?: string; temWhatsapp?: boolean } = {},
   ): Promise<boolean> {
     if (!this.client) return true; // sem IA, aceita qualquer HTTP 200
 
     if (!titulo && !descricao) return true; // sem conteúdo para validar
 
-    const prompt = `Este site pertence à empresa listada abaixo? Responda APENAS "sim" ou "nao".
+    const ufLine       = opts.uf   ? `\nUF: ${opts.uf}`    : '';
+    const cnaeLine     = opts.cnae ? `\nCNAE: ${opts.cnae}` : '';
+    const ufReject     = opts.uf
+      ? `\n- O site é claramente de empresa homônima em UF diferente de ${opts.uf}`
+      : '';
+    const whatsappLine = opts.temWhatsapp === false
+      ? '\nWhatsApp na página: não encontrado (incomum para pequenas empresas brasileiras)'
+      : '';
 
-Empresa: ${nome}
-CNPJ: ${cnpj}
+    const prompt = `Determine se o site abaixo pertence à empresa indicada. Responda APENAS "sim" ou "nao".
 
-Site encontrado:
+Empresa: ${nome} — CNPJ ${cnpj}${ufLine}${cnaeLine}
+
+Site:
 URL: ${url}
-Título: ${titulo}
-Descrição: ${descricao}`;
+Título: ${titulo || '(sem título)'}
+Descrição: ${descricao || '(sem descrição)'}${whatsappLine}
+
+Rejeite ("nao") se qualquer condição for verdadeira:
+- O site é de prefeitura, governo, câmara ou órgão público
+- O site é app ou plataforma de delivery, marketplace ou diretório de empresas
+- O título ou descrição indica outra empresa ou atividade incompatível com o CNAE${ufReject}
+- O site não apresenta nenhuma forma de contato direto (telefone, e-mail ou WhatsApp)`;
 
     try {
       await this.limiter.throttle();

@@ -32,6 +32,15 @@ data/
 # Configurações locais do Claude
 .claude/settings.local.json
 
+# Backups locais
+backup_pie.sql
+backup_pie_neon.sql
+backup_pie_neon_slim.sql
+*.sql.bak
+
+# Credenciais GCP
+*-key.json
+
 # Ferramentas de sistema e IDEs
 .DS_Store
 .vscode/

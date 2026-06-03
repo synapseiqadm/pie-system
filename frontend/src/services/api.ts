@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? (typeof window !== 'undefined' && window.location.hostname !== 'localhost' ? 'https://pie-system-production.up.railway.app' : 'http://localhost:3001');
+const API_URL = process.env.NEXT_PUBLIC_API_URL || 'https://pie-system-production.up.railway.app';
 
 // Leads
 export async function getLeads() {

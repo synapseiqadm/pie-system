@@ -20,11 +20,14 @@ export class CnaesService {
     if (search) {
       return this.repo
         .createQueryBuilder('c')
-        .where('c.codigo ILIKE :contains OR c.descricao ILIKE :contains', { contains: `%${search}%` })
+        .where(
+          `c.codigo ILIKE :contains OR public.unaccent(c.descricao) ILIKE public.unaccent(:contains)`,
+          { contains: `%${search}%` },
+        )
         .orderBy(`CASE
-          WHEN c.descricao ILIKE :exact  THEN 0
-          WHEN c.descricao ILIKE :starts THEN 1
-          WHEN c.codigo    ILIKE :exact  THEN 2
+          WHEN public.unaccent(c.descricao) ILIKE public.unaccent(:exact)  THEN 0
+          WHEN public.unaccent(c.descricao) ILIKE public.unaccent(:starts) THEN 1
+          WHEN c.codigo                     ILIKE :exact                   THEN 2
           ELSE 3 END`, 'ASC')
         .addOrderBy('c.descricao', 'ASC')
         .setParameter('exact',  search)

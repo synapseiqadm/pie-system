@@ -764,7 +764,7 @@ export default function SegmentosPage() {
                     {aiResult.cnaes.length > 0 && (
                       <div style={{ flex: '2 1 320px' }}>
                         <div style={{ fontSize: 11, fontWeight: 700, color: '#6b21a8', marginBottom: 6 }}>CNAEs sugeridos</div>
-                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: 4, maxHeight: 220, overflowY: 'auto', paddingRight: 4 }}>
                           {aiResult.cnaes.map(c => (
                             <div key={c.codigo} style={{ display: 'flex', alignItems: 'flex-start', gap: 8, padding: '6px 10px', background: '#faf5ff', borderRadius: 6, border: '1px solid #e9d5ff' }}>
                               <div style={{ flex: 1 }}>

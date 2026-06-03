@@ -88,7 +88,7 @@ export class BasePrimariaService {
     const codigos = rows.map((r) => r.cnae);
     const inList = codigos.map((c) => `'${c.replace(/'/g, "''")}'`).join(',');
     const desc: { codigo: string; descricao: string }[] = await this.pg.query(
-      `SELECT codigo, descricao FROM cnae WHERE codigo IN (${inList})`,
+      `SELECT codigo, descricao FROM public.cnae WHERE codigo IN (${inList})`,
     ).catch((err) => { this.logger.error(`cnae lookup failed: ${err?.message}`); return []; });
     const map = new Map(desc.map((d) => [d.codigo, d.descricao]));
     return rows.map((r) => ({ ...r, descricao: map.get(r.cnae) ?? r.cnae }));
@@ -117,7 +117,7 @@ export class BasePrimariaService {
     const codigos = rows.map((r) => r.codigo_municipio);
     const inList = codigos.map((c) => `'${c.replace(/'/g, "''")}'`).join(',');
     const desc: { codigo: string; descricao: string }[] = await this.pg.query(
-      `SELECT codigo, descricao FROM municipios WHERE codigo IN (${inList})`,
+      `SELECT codigo, descricao FROM public.municipios WHERE codigo IN (${inList})`,
     ).catch((err) => { this.logger.error(`municipios lookup failed: ${err?.message}`); return []; });
     const map = new Map(desc.map((d) => [d.codigo, d.descricao]));
     return rows.map((r) => ({ ...r, descricao: map.get(r.codigo_municipio) ?? r.codigo_municipio }));

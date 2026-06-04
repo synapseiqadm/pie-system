@@ -26,11 +26,9 @@ import { AiModule } from './ai/ai.module';
   imports: [
     TypeOrmModule.forRoot({
       type: 'postgres',
-      host: '127.0.0.1',
-      port: 5432,
-      username: 'pie',
-      password: 'pie',
-      database: 'pie',
+      url: process.env.DATABASE_URL ?? 'postgresql://pie:pie@127.0.0.1:5432/pie',
+      ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false,
+      schema: 'public',
       autoLoadEntities: true,
       synchronize: true,
     }),

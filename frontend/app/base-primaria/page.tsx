@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 
-const API = 'http://localhost:3001';
+const API = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 

@@ -5,7 +5,7 @@ import { getEmpresas, createEmpresa, updateEmpresa, deleteEmpresa } from '@/serv
 import ImportProgress from '../components/ImportProgress';
 import { useImport } from '../contexts/ImportContext';
 
-const API_URL = 'http://localhost:3001';
+const API_URL = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
 const PORTE_LABEL: Record<string, string> = {
   '00': 'Não informado', '01': 'ME', '03': 'EPP', '05': 'Demais', '10': 'Grande',
@@ -51,7 +51,7 @@ export default function EmpresasPage() {
     // PostgreSQL vazio — busca no Parquet (base primária)
     const params = new URLSearchParams({ page: String(p), limit: String(LIMIT) });
     if (q) params.set('q', q);
-    const res = await fetch(`http://localhost:3001/base-primaria/empresas/browse?${params}`).then(r => r.json());
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL||"https://pie-system-production.up.railway.app"}/base-primaria/empresas/browse?${params}`).then(r => r.json());
     setEmpresas((res.data ?? []).map((r: any) => ({
       id: 0,
       cnpjBasico: r.cnpj_basico,

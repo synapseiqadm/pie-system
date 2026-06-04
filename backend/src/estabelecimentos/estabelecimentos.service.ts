@@ -96,7 +96,7 @@ export class EstabelecimentosService {
           skip, take: limit, order: { cnpjCompleto: 'ASC' },
         }),
         this.db.query<{ count: string }[]>(
-          `SELECT COUNT(*)::int AS count FROM estabelecimentos
+          `SELECT COUNT(*)::int AS count FROM public.estabelecimentos
            WHERE cnpj_completo ILIKE $1 OR nome_fantasia ILIKE $1 OR cnpj_basico ILIKE $1`,
           [like],
         ),
@@ -107,7 +107,7 @@ export class EstabelecimentosService {
     const [rows, [{ estimate }]] = await Promise.all([
       this.repo.find({ skip, take: limit, order: { cnpjCompleto: 'ASC' } }),
       this.db.query<{ estimate: string }[]>(
-        `SELECT GREATEST(0, reltuples)::bigint AS estimate FROM pg_class WHERE relname = 'estabelecimentos'`,
+        `SELECT COALESCE(GREATEST(0, reltuples), 0)::bigint AS estimate FROM pg_class WHERE relname = 'estabelecimentos' LIMIT 1`,
       ),
     ]);
     return [rows, Number(estimate)];

@@ -3,16 +3,14 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Recorte, FiltrosRecorte } from './entities/recorte.entity';
 import { CreateRecorteDto } from './dto/create-recorte.dto';
-import { DuckDbService } from '../base-primaria/duckdb.service';
-import { ParquetService } from '../base-primaria/parquet.service';
+import { BigQueryService } from '../base-primaria/bigquery.service';
 
 @Injectable()
 export class RecortesService {
   constructor(
     @InjectRepository(Recorte)
     private readonly repo: Repository<Recorte>,
-    private readonly duck: DuckDbService,
-    private readonly parquet: ParquetService,
+    private readonly bq: BigQueryService,
   ) {}
 
   findAll() {
@@ -69,7 +67,7 @@ export class RecortesService {
 
     if (f.bairros?.length) {
       const parts = f.bairros.map(
-        b => `TRIM(LOWER(e.bairro)) ILIKE '%${b.toLowerCase().replace(/'/g, "''")}%'`,
+        b => `TRIM(LOWER(e.bairro)) LIKE '%${b.toLowerCase().replace(/'/g, "''")}%'`,
       );
       clauses.push(`(${parts.join(' OR ')})`);
     }
@@ -78,25 +76,20 @@ export class RecortesService {
   }
 
   buildFrom(): string {
-    return `read_parquet('${this.parquet.globPath('estabelecimentos')}') e`;
+    return `${this.bq.table('estabelecimentos')} e`;
   }
 
   buildEmpresasJoin(): { join: string; col: string } {
-    if (!this.parquet.hasFiles('empresas')) return { join: '', col: `'' AS capital_social` };
-    const empFrom = `read_parquet('${this.parquet.globPath('empresas')}')`;
     return {
-      join: `LEFT JOIN ${empFrom} emp ON TRIM(emp.cnpj_basico) = TRIM(e.cnpj_basico)`,
+      join: `LEFT JOIN ${this.bq.table('empresas')} emp ON TRIM(emp.cnpj_basico) = TRIM(e.cnpj_basico)`,
       col:  `COALESCE(TRIM(emp.capital_social), '') AS capital_social`,
     };
   }
 
-  // Cláusulas de filtro para o alias `emp` (empresas) — requer buildEmpresasJoin() no FROM
   buildEmpresasWhere(f: FiltrosRecorte): string[] {
-    if (!this.parquet.hasFiles('empresas')) return [];
     const clauses: string[] = [];
 
     if (f.portes?.length) {
-      // 'MEI' é virtual: mapeia para natureza_jurídica = '2135' (Empresário Individual)
       const realPortes = f.portes.filter(p => p !== 'MEI');
       const includeMEI = f.portes.includes('MEI');
       const parts: string[] = [];
@@ -109,13 +102,12 @@ export class RecortesService {
       clauses.push(`TRIM(emp.natureza_juridica) IN (${list})`);
     }
 
-    const capExpr = `TRY_CAST(REPLACE(COALESCE(NULLIF(TRIM(emp.capital_social),''),'0'),',','.') AS FLOAT)`;
+    const capExpr = `SAFE_CAST(REPLACE(COALESCE(NULLIF(TRIM(emp.capital_social),''),'0'),',','.') AS FLOAT64)`;
     if (f.capitalMin != null) clauses.push(`${capExpr} >= ${f.capitalMin}`);
     if (f.capitalMax != null) clauses.push(`${capExpr} <= ${f.capitalMax}`);
     return clauses;
   }
 
-  // Análise agregada a partir de filtros — usada tanto por analise(id) como por analise-preview
   async analiseFromFiltros(filtros: FiltrosRecorte): Promise<{
     total: number;
     ufs:       { uf: string; total: number }[];
@@ -124,10 +116,6 @@ export class RecortesService {
     capital:   { faixa: string; total: number }[];
     naturezas: { natureza: string; total: number }[];
   }> {
-    if (!this.parquet.hasFiles('estabelecimentos')) {
-      return { total: 0, ufs: [], cnaes: [], portes: [], capital: [], naturezas: [] };
-    }
-
     const from  = this.buildFrom();
     const { join: empJoin } = this.buildEmpresasJoin();
     const eClauses   = this.buildWhere(filtros);
@@ -136,14 +124,9 @@ export class RecortesService {
     const where  = allClauses.length ? `WHERE ${allClauses.join(' AND ')}` : '';
     const dedup  = `QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico,e.cnpj_ordem,e.cnpj_dv ORDER BY e.cnpj_basico) = 1`;
 
-    const hasEmpresas = this.parquet.hasFiles('empresas');
-    const portExpr = hasEmpresas
-      ? `CASE WHEN TRIM(emp.natureza_juridica) = '2135' THEN 'MEI' ELSE COALESCE(TRIM(emp.porte),'00') END`
-      : `'00'`;
-    const natExpr = hasEmpresas ? `COALESCE(TRIM(emp.natureza_juridica), '0000')` : `'0000'`;
-    const capExpr = hasEmpresas
-      ? `TRY_CAST(REPLACE(COALESCE(NULLIF(TRIM(emp.capital_social),''),'0'),',','.') AS FLOAT)`
-      : `0`;
+    const portExpr = `CASE WHEN TRIM(emp.natureza_juridica) = '2135' THEN 'MEI' ELSE COALESCE(TRIM(emp.porte),'00') END`;
+    const natExpr  = `COALESCE(TRIM(emp.natureza_juridica), '0000')`;
+    const capExpr  = `SAFE_CAST(REPLACE(COALESCE(NULLIF(TRIM(emp.capital_social),''),'0'),',','.') AS FLOAT64)`;
 
     const sql = `
       WITH base AS (
@@ -161,15 +144,15 @@ export class RecortesService {
           END AS faixa_capital
         FROM ${from} ${empJoin} ${where} ${dedup}
       )
-      SELECT 'total'   AS dim, ''             AS val, COUNT(*)::int AS n FROM base
-      UNION ALL SELECT 'uf',       uf,           COUNT(*)::int FROM base GROUP BY uf
-      UNION ALL SELECT 'cnae',     cnae,         COUNT(*)::int FROM base GROUP BY cnae
-      UNION ALL SELECT 'porte',    porte,        COUNT(*)::int FROM base GROUP BY porte
-      UNION ALL SELECT 'natureza', natureza,     COUNT(*)::int FROM base GROUP BY natureza
-      UNION ALL SELECT 'capital',  faixa_capital,COUNT(*)::int FROM base GROUP BY faixa_capital
+      SELECT 'total'   AS dim, ''             AS val, CAST(COUNT(*) AS INT64) AS n FROM base
+      UNION ALL SELECT 'uf',       uf,           CAST(COUNT(*) AS INT64) FROM base GROUP BY uf
+      UNION ALL SELECT 'cnae',     cnae,         CAST(COUNT(*) AS INT64) FROM base GROUP BY cnae
+      UNION ALL SELECT 'porte',    porte,        CAST(COUNT(*) AS INT64) FROM base GROUP BY porte
+      UNION ALL SELECT 'natureza', natureza,     CAST(COUNT(*) AS INT64) FROM base GROUP BY natureza
+      UNION ALL SELECT 'capital',  faixa_capital,CAST(COUNT(*) AS INT64) FROM base GROUP BY faixa_capital
     `;
 
-    const rows = await this.duck.query<{ dim: string; val: string; n: number }>(sql);
+    const rows = await this.bq.query<{ dim: string; val: string; n: number }>(sql);
     const byDim = (dim: string) => rows.filter(r => r.dim === dim);
 
     const total = Number(byDim('total')[0]?.n ?? 0);
@@ -209,7 +192,6 @@ export class RecortesService {
 
   async executar(id: number, page = 1, limit = 50) {
     const recorte = await this.findOne(id);
-    if (!this.parquet.hasFiles('estabelecimentos')) return { total: 0, data: [] };
 
     const from  = this.buildFrom();
     const { join: empJoin, col: empCol } = this.buildEmpresasJoin();
@@ -221,33 +203,31 @@ export class RecortesService {
 
     const dedup = `QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1`;
 
-    // Sequential — single DuckDB connection cannot handle concurrent queries
-    const countRow = await this.duck.query<{ total: number }>(
-      `SELECT COUNT(*)::int AS total FROM (SELECT e.cnpj_basico FROM ${from} ${empJoin} ${where} ${dedup}) t`,
+    const countRow = await this.bq.query<{ total: number }>(
+      `SELECT CAST(COUNT(*) AS INT64) AS total FROM (SELECT e.cnpj_basico FROM ${from} ${empJoin} ${where} ${dedup}) t`,
     );
-    const rows = await this.duck.query<Record<string, string>>(
+    const rows = await this.bq.query<Record<string, string>>(
       `SELECT
         TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
-        TRIM(e.cnpj_basico)          AS cnpj_basico,
-        TRIM(e.nome_fantasia)        AS nome_fantasia,
-        TRIM(e.situacao_cadastral)   AS situacao_cadastral,
+        TRIM(e.cnpj_basico)           AS cnpj_basico,
+        TRIM(e.nome_fantasia)         AS nome_fantasia,
+        TRIM(e.situacao_cadastral)    AS situacao_cadastral,
         TRIM(e.cnae_fiscal_principal) AS cnae,
-        TRIM(e.uf)                   AS uf,
-        TRIM(e.codigo_municipio)     AS codigo_municipio,
+        TRIM(e.uf)                    AS uf,
+        TRIM(e.codigo_municipio)      AS codigo_municipio,
         TRIM(e.ddd_1) || TRIM(e.telefone_1) AS telefone,
-        TRIM(e.correio_eletronico)   AS email,
+        TRIM(e.correio_eletronico)    AS email,
         ${empCol}
       FROM ${from}
       ${empJoin}
       ${where}
       ${dedup}
-      ORDER BY e.cnpj_basico
+      ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
       LIMIT ${limit} OFFSET ${offset}`,
     );
 
     const total = Number(countRow[0]?.total ?? 0);
 
-    // Atualiza cache de total e data de execução
     await this.repo.update(id, { totalCached: total, executadoEm: new Date() });
 
     return { total, data: rows };
@@ -262,60 +242,48 @@ export class RecortesService {
     const ordem  = c.slice(8, 12);
     const dv     = c.slice(12, 14);
 
-    const estabFrom = `read_parquet('${this.parquet.globPath('estabelecimentos')}')`;
-    const empFrom   = this.parquet.hasFiles('empresas')
-      ? `read_parquet('${this.parquet.globPath('empresas')}')`
-      : null;
-    const socFrom   = this.parquet.hasFiles('socios')
-      ? `read_parquet('${this.parquet.globPath('socios')}')`
-      : null;
+    const estabFrom = this.bq.table('estabelecimentos');
+    const empFrom   = this.bq.table('empresas');
+    const socFrom   = this.bq.table('socios');
 
-    const joinEmp = empFrom
-      ? `LEFT JOIN ${empFrom} emp ON TRIM(emp.cnpj_basico) = '${basico}'`
-      : '';
-    const empCols = empFrom
-      ? `, TRIM(emp.razao_social) AS razao_social
-           , TRIM(emp.natureza_juridica) AS natureza_juridica
-           , TRIM(emp.qualificacao_responsavel) AS qualificacao_responsavel
-           , TRIM(emp.capital_social) AS capital_social
-           , TRIM(emp.porte) AS porte
-           , TRIM(emp.ente_federativo_responsavel) AS ente_federativo_responsavel`
-      : '';
-
-    // Sequential queries — single DuckDB connection cannot handle concurrent .all() calls
-    const estabRows = await this.duck.query<Record<string, string>>(`
+    const estabRows = await this.bq.query<Record<string, string>>(`
       SELECT
-        TRIM(e.cnpj_basico)              AS cnpj_basico,
-        TRIM(e.cnpj_ordem)               AS cnpj_ordem,
-        TRIM(e.cnpj_dv)                  AS cnpj_dv,
+        TRIM(e.cnpj_basico)               AS cnpj_basico,
+        TRIM(e.cnpj_ordem)                AS cnpj_ordem,
+        TRIM(e.cnpj_dv)                   AS cnpj_dv,
         TRIM(e.identificador_matriz_filial) AS matriz_filial,
-        TRIM(e.nome_fantasia)            AS nome_fantasia,
-        TRIM(e.situacao_cadastral)       AS situacao_cadastral,
-        TRIM(e.data_situacao_cadastral)  AS data_situacao_cadastral,
+        TRIM(e.nome_fantasia)             AS nome_fantasia,
+        TRIM(e.situacao_cadastral)        AS situacao_cadastral,
+        TRIM(e.data_situacao_cadastral)   AS data_situacao_cadastral,
         TRIM(e.motivo_situacao_cadastral) AS motivo_situacao_cadastral,
-        TRIM(e.data_inicio_atividade)    AS data_inicio_atividade,
-        TRIM(e.cnae_fiscal_principal)    AS cnae_fiscal_principal,
-        TRIM(e.cnae_fiscal_secundaria)   AS cnae_fiscal_secundaria,
-        TRIM(e.tipo_logradouro)          AS tipo_logradouro,
-        TRIM(e.logradouro)               AS logradouro,
-        TRIM(e.numero)                   AS numero,
-        TRIM(e.complemento)              AS complemento,
-        TRIM(e.bairro)                   AS bairro,
-        TRIM(e.cep)                      AS cep,
-        TRIM(e.uf)                       AS uf,
-        TRIM(e.codigo_municipio)         AS codigo_municipio,
-        TRIM(e.ddd_1)                    AS ddd_1,
-        TRIM(e.telefone_1)               AS telefone_1,
-        TRIM(e.ddd_2)                    AS ddd_2,
-        TRIM(e.telefone_2)               AS telefone_2,
-        TRIM(e.ddd_fax)                  AS ddd_fax,
-        TRIM(e.fax)                      AS fax,
-        TRIM(e.correio_eletronico)       AS correio_eletronico,
-        TRIM(e.situacao_especial)        AS situacao_especial,
-        TRIM(e.data_situacao_especial)   AS data_situacao_especial
-        ${empCols}
+        TRIM(e.data_inicio_atividade)     AS data_inicio_atividade,
+        TRIM(e.cnae_fiscal_principal)     AS cnae_fiscal_principal,
+        TRIM(e.cnae_fiscal_secundaria)    AS cnae_fiscal_secundaria,
+        TRIM(e.tipo_logradouro)           AS tipo_logradouro,
+        TRIM(e.logradouro)                AS logradouro,
+        TRIM(e.numero)                    AS numero,
+        TRIM(e.complemento)               AS complemento,
+        TRIM(e.bairro)                    AS bairro,
+        TRIM(e.cep)                       AS cep,
+        TRIM(e.uf)                        AS uf,
+        TRIM(e.codigo_municipio)          AS codigo_municipio,
+        TRIM(e.ddd_1)                     AS ddd_1,
+        TRIM(e.telefone_1)                AS telefone_1,
+        TRIM(e.ddd_2)                     AS ddd_2,
+        TRIM(e.telefone_2)                AS telefone_2,
+        TRIM(e.ddd_fax)                   AS ddd_fax,
+        TRIM(e.fax)                       AS fax,
+        TRIM(e.correio_eletronico)        AS correio_eletronico,
+        TRIM(e.situacao_especial)         AS situacao_especial,
+        TRIM(e.data_situacao_especial)    AS data_situacao_especial,
+        TRIM(emp.razao_social)            AS razao_social,
+        TRIM(emp.natureza_juridica)       AS natureza_juridica,
+        TRIM(emp.qualificacao_responsavel) AS qualificacao_responsavel,
+        TRIM(emp.capital_social)          AS capital_social,
+        TRIM(emp.porte)                   AS porte,
+        TRIM(emp.ente_federativo_responsavel) AS ente_federativo_responsavel
       FROM ${estabFrom} e
-      ${joinEmp}
+      LEFT JOIN ${empFrom} emp ON TRIM(emp.cnpj_basico) = '${basico}'
       WHERE TRIM(e.cnpj_basico) = '${basico}'
         AND TRIM(e.cnpj_ordem)  = '${ordem}'
         AND TRIM(e.cnpj_dv)     = '${dv}'
@@ -324,19 +292,17 @@ export class RecortesService {
 
     if (estabRows.length === 0) throw new NotFoundException(`CNPJ ${cnpj} não encontrado`);
 
-    const sociosRows = socFrom
-      ? await this.duck.query<Record<string, string>>(`
-          SELECT
-            TRIM(s.identificador_socio)    AS identificador_socio,
-            TRIM(s.nome_socio)             AS nome_socio,
-            TRIM(s.cpf_cnpj_socio)         AS cpf_cnpj_socio,
-            TRIM(s.qualificacao_socio)     AS qualificacao_socio,
-            TRIM(s.data_entrada_sociedade) AS data_entrada_sociedade,
-            TRIM(s.faixa_etaria)           AS faixa_etaria
-          FROM ${socFrom} s
-          WHERE TRY_CAST(TRIM(s.cnpj_basico) AS BIGINT) = ${BigInt(basico)}
-        `)
-      : [];
+    const sociosRows = await this.bq.query<Record<string, string>>(`
+      SELECT
+        TRIM(s.identificador_socio)    AS identificador_socio,
+        TRIM(s.nome_socio)             AS nome_socio,
+        TRIM(s.cpf_cnpj_socio)         AS cpf_cnpj_socio,
+        TRIM(s.qualificacao_socio)     AS qualificacao_socio,
+        TRIM(s.data_entrada_sociedade) AS data_entrada_sociedade,
+        TRIM(s.faixa_etaria)           AS faixa_etaria
+      FROM ${socFrom} s
+      WHERE SAFE_CAST(TRIM(s.cnpj_basico) AS INT64) = ${BigInt(basico)}
+    `);
 
     return { estabelecimento: estabRows[0], socios: sociosRows };
   }
@@ -345,7 +311,6 @@ export class RecortesService {
 
   async *exportarCsv(id: number): AsyncGenerator<string> {
     const recorte = await this.findOne(id);
-    if (!this.parquet.hasFiles('estabelecimentos')) return;
 
     const from  = this.buildFrom();
     const { join: empJoin, col: empCol } = this.buildEmpresasJoin();
@@ -360,7 +325,7 @@ export class RecortesService {
     let offset = 0;
 
     while (true) {
-      const rows = await this.duck.query<Record<string, string>>(`
+      const rows = await this.bq.query<Record<string, string>>(`
         SELECT
           TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
           TRIM(e.cnpj_basico)           AS cnpj_basico,
@@ -376,7 +341,7 @@ export class RecortesService {
         ${empJoin}
         ${where}
         QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
-        ORDER BY e.cnpj_basico
+        ORDER BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
         LIMIT ${BATCH} OFFSET ${offset}
       `);
 

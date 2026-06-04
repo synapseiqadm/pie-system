@@ -34,13 +34,13 @@ export class EmpresasService {
       const like = `%${search}%`;
       const [rows, [{ count }]] = await Promise.all([
         this.db.query<Empresa[]>(
-          `SELECT * FROM empresa
+          `SELECT * FROM public.empresa
            WHERE "razaoSocial" ILIKE $1 OR "cnpjBasico" ILIKE $1
            ORDER BY "razaoSocial" LIMIT $2 OFFSET $3`,
           [like, limit, skip],
         ),
         this.db.query<{ count: string }[]>(
-          `SELECT COUNT(*)::int AS count FROM empresa
+          `SELECT COUNT(*)::int AS count FROM public.empresa
            WHERE "razaoSocial" ILIKE $1 OR "cnpjBasico" ILIKE $1`,
           [like],
         ),
@@ -48,16 +48,16 @@ export class EmpresasService {
       return [rows, Number(count)];
     }
     // No search: use fast row estimate instead of COUNT(*)
-    const [rows, [{ estimate }]] = await Promise.all([
+    const [rows, estimateRows] = await Promise.all([
       this.db.query<Empresa[]>(
-        `SELECT * FROM empresa ORDER BY "razaoSocial" LIMIT $1 OFFSET $2`,
+        `SELECT * FROM public.empresa ORDER BY "razaoSocial" LIMIT $1 OFFSET $2`,
         [limit, skip],
       ),
       this.db.query<{ estimate: string }[]>(
-        `SELECT GREATEST(0, reltuples)::bigint AS estimate FROM pg_class WHERE relname = 'empresa'`,
+        `SELECT COALESCE(GREATEST(0, reltuples), 0)::bigint AS estimate FROM pg_class WHERE relname = 'empresa' LIMIT 1`,
       ),
     ]);
-    return [rows, Number(estimate)];
+    return [rows, Number(estimateRows[0]?.estimate ?? 0)];
   }
 
   findOne(id: number) {

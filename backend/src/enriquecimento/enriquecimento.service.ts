@@ -2,8 +2,7 @@ import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, LessThan } from 'typeorm';
 import { RecortesService } from '../recortes/recortes.service';
-import { DuckDbService } from '../base-primaria/duckdb.service';
-import { ParquetService } from '../base-primaria/parquet.service';
+import { BigQueryService } from '../base-primaria/bigquery.service';
 import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
 import { CnpjSiteCache } from './entities/cnpj-site-cache.entity';
 import { AiService } from '../ai/ai.service';
@@ -289,6 +288,27 @@ async function findReclameAqui(nome: string): Promise<string | null> {
   return null;
 }
 
+const BANNED_HOSTS = new Set([
+  'ifood.com.br', 'rappi.com.br', 'ubereats.com', 'aiqfome.com', '99food.com.br',
+  'tripadvisor.com.br', 'tripadvisor.com',
+  'yelp.com', 'foursquare.com',
+  'guiamais.com.br', 'telelistas.net', 'encontra.com.br', 'yellowpages.com.br',
+]);
+
+function isBannedUrl(url: string): boolean {
+  try {
+    const { hostname } = new URL(url);
+    const h = hostname.toLowerCase();
+    if (h.endsWith('.gov.br') || h === 'gov.br') return true;
+    if (h.includes('prefeitura')) return true;
+    if (h.includes('camara.leg')) return true;
+    const bare = h.startsWith('www.') ? h.slice(4) : h;
+    return BANNED_HOSTS.has(bare);
+  } catch {
+    return false;
+  }
+}
+
 @Injectable()
 export class EnriquecimentoService {
   private readonly logger = new Logger(EnriquecimentoService.name);
@@ -298,8 +318,7 @@ export class EnriquecimentoService {
 
   constructor(
     private readonly recortes: RecortesService,
-    private readonly duck: DuckDbService,
-    private readonly parquet: ParquetService,
+    private readonly bq: BigQueryService,
     private readonly ai: AiService,
     @InjectRepository(SiteEnriquecimento)
     private readonly siteRepo: Repository<SiteEnriquecimento>,
@@ -325,10 +344,6 @@ export class EnriquecimentoService {
     limit = 50,
   ): Promise<{ stats: TelefoneStats; data: TelefoneRow[]; total: number }> {
     const recorte = await this.recortes.findOne(recorteId);
-    if (!this.parquet.hasFiles('estabelecimentos')) {
-      return { stats: { total: 0, celular: 0, fixo: 0, invalido: 0, sem_telefone: 0, aproveitamento: 0 }, data: [], total: 0 };
-    }
-
     const clauses = this.recortes.buildWhere(recorte.filtros);
     const from    = this.recortes.buildFrom();
     const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
@@ -356,12 +371,11 @@ export class EnriquecimentoService {
       QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
     `;
 
-    // Sequential — single DuckDB connection cannot handle concurrent queries
-    const statsRows = await this.duck.query<{ tipo: string; cnt: number }>(`
-      SELECT tipo, COUNT(*)::int AS cnt FROM (${sql}) t GROUP BY tipo
+    const statsRows = await this.bq.query<{ tipo: string; cnt: number }>(`
+      SELECT tipo, CAST(COUNT(*) AS INT64) AS cnt FROM (${sql}) t GROUP BY tipo
     `);
     const dataRows = limit > 0
-      ? await this.duck.query<{ cnpj: string; nome_fantasia: string; uf: string; ddd: string; numero: string; tipo: string }>(`
+      ? await this.bq.query<{ cnpj: string; nome_fantasia: string; uf: string; ddd: string; numero: string; tipo: string }>(`
           SELECT * FROM (${sql}) t
           WHERE tipo IN ('celular', 'fixo')
           ORDER BY tipo, ddd, numero
@@ -478,8 +492,9 @@ export class EnriquecimentoService {
     let foundMeta: PageMeta | null = null;
 
     for (const url of [...new Set(phase1Candidates)]) {
+      if (isBannedUrl(url)) continue;
       const httpResult = await verifyUrl(url);
-      if (!httpResult) continue;
+      if (!httpResult || isBannedUrl(httpResult)) continue;
       foundMeta = await fetchPageMeta(httpResult);
       found     = httpResult;
       usedSlug  = url;
@@ -500,12 +515,16 @@ export class EnriquecimentoService {
       ];
 
       for (const url of [...new Set(phase2Candidates)]) {
+        if (isBannedUrl(url)) continue;
         const httpResult = await verifyUrl(url);
-        if (!httpResult) continue;
+        if (!httpResult || isBannedUrl(httpResult)) continue;
 
         const meta = await fetchPageMeta(httpResult);
         if (this.ai.enabled && meta && (meta.title || meta.description)) {
-          const valid = await this.ai.validarSite(httpResult, meta.title, meta.description, nome, cnpj);
+          const valid = await this.ai.validarSite(
+            httpResult, meta.title, meta.description, nome, cnpj,
+            { uf, cnae, temWhatsapp: !!meta.whatsappUrl },
+          );
           if (!valid) continue;
         }
 
@@ -541,15 +560,11 @@ export class EnriquecimentoService {
     onProgress: (done: number, total: number, found: number) => void,
   ): Promise<{ total: number; encontrado: number; nao_encontrado: number }> {
     const recorte = await this.recortes.findOne(recorteId);
-    if (!this.parquet.hasFiles('estabelecimentos')) {
-      return { total: 0, encontrado: 0, nao_encontrado: 0 };
-    }
-
     const clauses = this.recortes.buildWhere(recorte.filtros);
     const from    = this.recortes.buildFrom();
     const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const rows = await this.duck.query<{ cnpj: string; nome: string; email: string; cnae: string; uf: string }>(`
+    const rows = await this.bq.query<{ cnpj: string; nome: string; email: string; cnae: string; uf: string }>(`
       SELECT
         TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
         COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), TRIM(e.cnpj_basico)) AS nome,
@@ -605,22 +620,23 @@ export class EnriquecimentoService {
     const records = await this.siteRepo.find({ where: { recorteId, status: 'encontrado' } });
     if (!records.length) return { total: 0, mantidos: 0, rejeitados: 0 };
 
-    // Busca nomes em lote via DuckDB
     const cnpjs = records.map(r => `'${r.cnpj.replace(/'/g, "''")}'`).join(',');
-    const nomeMap = new Map<string, string>();
+    const ctxMap = new Map<string, { nome: string; uf: string; cnae: string }>();
     try {
       const from = this.recortes.buildFrom();
-      const rows = await this.duck.query<{ cnpj: string; nome: string }>(`
+      const rows = await this.bq.query<{ cnpj: string; nome: string; uf: string; cnae: string }>(`
         SELECT
           TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
-          COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), TRIM(e.cnpj_basico)) AS nome
+          COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), TRIM(e.cnpj_basico)) AS nome,
+          COALESCE(TRIM(e.uf), '') AS uf,
+          COALESCE(TRIM(e.cnae_fiscal_principal), '') AS cnae
         FROM ${from}
         WHERE TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) IN (${cnpjs})
         QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
       `);
-      for (const r of rows) nomeMap.set(r.cnpj, r.nome);
+      for (const r of rows) ctxMap.set(r.cnpj, { nome: r.nome, uf: r.uf, cnae: r.cnae });
     } catch (err: any) {
-      this.logger.warn(`revalidarSites: falha ao buscar nomes — ${err?.message}`);
+      this.logger.warn(`revalidarSites: falha ao buscar contexto — ${err?.message}`);
     }
 
     const total = records.length;
@@ -632,11 +648,29 @@ export class EnriquecimentoService {
       const batch = records.slice(i, i + CONCURRENCY);
       await Promise.all(batch.map(async (record) => {
         if (!record.url) return;
+
+        if (isBannedUrl(record.url)) {
+          record.status       = 'nao_encontrado';
+          record.url          = undefined;
+          record.slug         = undefined;
+          record.instagramUrl = undefined;
+          record.facebookUrl  = undefined;
+          record.linkedinUrl  = undefined;
+          record.whatsappUrl  = undefined;
+          await this.siteRepo.save(record);
+          rejeitados++;
+          return;
+        }
+
         const meta = await fetchPageMeta(record.url);
         if (!meta || (!meta.title && !meta.description)) return; // sem conteúdo para validar
 
-        const nome = nomeMap.get(record.cnpj) ?? record.cnpj;
-        const valid = await this.ai.validarSite(record.url, meta.title, meta.description, nome, record.cnpj);
+        const ctx  = ctxMap.get(record.cnpj);
+        const nome = ctx?.nome ?? record.cnpj;
+        const valid = await this.ai.validarSite(
+          record.url, meta.title, meta.description, nome, record.cnpj,
+          { uf: ctx?.uf, cnae: ctx?.cnae, temWhatsapp: !!meta.whatsappUrl },
+        );
         if (!valid) {
           record.status       = 'nao_encontrado';
           record.url          = undefined;
@@ -648,7 +682,6 @@ export class EnriquecimentoService {
           await this.siteRepo.save(record);
           rejeitados++;
         } else {
-          // Site confirmado — atualiza redes sociais (pode ter mudado ou não ter sido extraído antes)
           record.instagramUrl = meta.instagramUrl;
           record.facebookUrl  = meta.facebookUrl;
           record.linkedinUrl  = meta.linkedinUrl;

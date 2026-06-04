@@ -3,7 +3,7 @@
 import { useEffect, useState, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 
-const API = 'http://localhost:3001';
+const API = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
 type Row = {
   cnpj: string;

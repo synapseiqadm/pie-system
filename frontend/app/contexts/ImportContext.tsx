@@ -87,7 +87,7 @@ export function ImportProvider({ children }: { children: React.ReactNode }) {
   }, [setJob]);
 
   const cancelImport = useCallback((key: string) => {
-    fetch(`http://localhost:3001/${key}/upload/cancel`, { method: 'POST' }).catch(() => {});
+    fetch(`${process.env.NEXT_PUBLIC_API_URL||"https://pie-system-production.up.railway.app"}/${key}/upload/cancel`, { method: 'POST' }).catch(() => {});
   }, []);
 
   const dismissJob = useCallback((key: string) => {

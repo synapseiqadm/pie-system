@@ -1,6 +1,6 @@
 import {
-  Controller, Get, Post, Delete, Query, Param,
-  UseInterceptors, UploadedFile, Res, HttpCode,
+  Controller, Get, Post, Query, Param,
+  UseInterceptors, UploadedFile, Res,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -8,7 +8,7 @@ import * as path from 'path';
 import * as os from 'os';
 import type { Response } from 'express';
 import { BasePrimariaService } from './base-primaria.service';
-import { ParquetService, TipoBase } from './parquet.service';
+import { BigQueryUploadService, TipoBase } from './bigquery-upload.service';
 
 const TWO_GB = 2 * 1024 * 1024 * 1024;
 
@@ -25,7 +25,7 @@ function sse(res: Response, data: object) {
 export class BasePrimariaController {
   constructor(
     private readonly service: BasePrimariaService,
-    private readonly parquet: ParquetService,
+    private readonly upload: BigQueryUploadService,
   ) {}
 
   // ─── Status & Análise ────────────────────────────────────────────────────
@@ -81,7 +81,7 @@ export class BasePrimariaController {
     return this.service.browseSocios(q, page ? Number(page) : 1, limit ? Number(limit) : 50);
   }
 
-  // ─── Upload & Conversão ───────────────────────────────────────────────────
+  // ─── Upload ───────────────────────────────────────────────────────────────
 
   @Post('upload/:tipo')
   @UseInterceptors(FileInterceptor('file', { storage: tmpStorage, limits: { fileSize: TWO_GB } }))
@@ -101,11 +101,11 @@ export class BasePrimariaController {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders();
 
-    const partIndex = this.parquet.nextPartIndex(tipoValido);
+    const partIndex = this.upload.nextPartIndex(tipoValido);
     sse(res, { stage: 'iniciando', detail: file.originalname, partIndex });
 
     try {
-      for await (const event of this.parquet.convertZip(file.path, tipoValido, partIndex)) {
+      for await (const event of this.upload.convertZip(file.path, tipoValido, partIndex)) {
         sse(res, event);
       }
     } catch (err: any) {
@@ -115,13 +115,5 @@ export class BasePrimariaController {
     }
 
     res.end();
-  }
-
-  // ─── Gerenciar arquivos ───────────────────────────────────────────────────
-
-  @Delete('arquivo/:tipo/:arquivo')
-  @HttpCode(204)
-  deleteArquivo(@Param('tipo') tipo: string, @Param('arquivo') arquivo: string) {
-    this.parquet.deleteFile(tipo as TipoBase, arquivo);
   }
 }

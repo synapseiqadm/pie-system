@@ -5,7 +5,7 @@ import { getEstabelecimentos, createEstabelecimento, updateEstabelecimento, dele
 import ImportProgress from '../components/ImportProgress';
 import { useImport } from '../contexts/ImportContext';
 
-const API_URL = 'http://localhost:3001';
+const API_URL = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
 const SITUACAO_LABEL: Record<string, string> = {
   '01': 'Nula', '02': 'Ativa', '03': 'Suspensa', '04': 'Inapta', '08': 'Baixada',

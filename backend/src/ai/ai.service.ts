@@ -69,7 +69,12 @@ export class AiService {
     const temMunis = municipiosCandidatos.length > 0;
 
     const cnaeBloco = temCnaes
-      ? `CNAEs encontrados na base para este perfil (use preferencialmente estes):\n${cnaesCandidatos.map(c => `${c.codigo} - ${c.descricao}`).join('\n')}`
+      ? `CNAEs encontrados na base (ponto de partida — complemente com seu conhecimento):\n${cnaesCandidatos.map(c => `${c.codigo} - ${c.descricao}`).join('\n')}
+
+Use estes CNAEs como base, mas adicione todos os outros relevantes que você conhece da tabela CNAE brasileira:
+- Inclua variantes do mesmo setor (ex: para farmácias: 4771701, 4771702, 4771703, 4771704)
+- Inclua atacado, varejo e serviços relacionados quando aplicável
+- Retorne de 5 a 15 CNAEs no total; formato obrigatório: exatamente 7 dígitos sem pontos/hífens/barras`
       : `Nenhum CNAE foi pré-filtrado pelo banco. Use seu conhecimento completo da tabela CNAE brasileira.
 Você conhece bem a tabela — mapeie o setor descrito para todos os CNAEs relevantes:
 - Inclua fabricação, comércio (atacado e varejo) E serviços quando aplicável ao setor
@@ -110,7 +115,7 @@ Regras:
     try {
       await this.limiter.throttle();
       const msg = await this.client.messages.create({
-        model: 'claude-haiku-4-5-20251001',
+        model: 'claude-sonnet-4-6',
         max_tokens: 2048,
         messages: [{ role: 'user', content: prompt }],
       });
@@ -178,20 +183,35 @@ Máximo 5 domínios. Não inclua provedores genéricos de hospedagem.`;
     descricao: string,
     nome: string,
     cnpj: string,
+    opts: { uf?: string; cnae?: string; temWhatsapp?: boolean } = {},
   ): Promise<boolean> {
     if (!this.client) return true; // sem IA, aceita qualquer HTTP 200
 
     if (!titulo && !descricao) return true; // sem conteúdo para validar
 
-    const prompt = `Este site pertence à empresa listada abaixo? Responda APENAS "sim" ou "nao".
+    const ufLine       = opts.uf   ? `\nUF: ${opts.uf}`    : '';
+    const cnaeLine     = opts.cnae ? `\nCNAE: ${opts.cnae}` : '';
+    const ufReject     = opts.uf
+      ? `\n- O site é claramente de empresa homônima em UF diferente de ${opts.uf}`
+      : '';
+    const whatsappLine = opts.temWhatsapp === false
+      ? '\nWhatsApp na página: não encontrado (incomum para pequenas empresas brasileiras)'
+      : '';
 
-Empresa: ${nome}
-CNPJ: ${cnpj}
+    const prompt = `Determine se o site abaixo pertence à empresa indicada. Responda APENAS "sim" ou "nao".
 
-Site encontrado:
+Empresa: ${nome} — CNPJ ${cnpj}${ufLine}${cnaeLine}
+
+Site:
 URL: ${url}
-Título: ${titulo}
-Descrição: ${descricao}`;
+Título: ${titulo || '(sem título)'}
+Descrição: ${descricao || '(sem descrição)'}${whatsappLine}
+
+Rejeite ("nao") se qualquer condição for verdadeira:
+- O site é de prefeitura, governo, câmara ou órgão público
+- O site é app ou plataforma de delivery, marketplace ou diretório de empresas
+- O título ou descrição indica outra empresa ou atividade incompatível com o CNAE${ufReject}
+- O site não apresenta nenhuma forma de contato direto (telefone, e-mail ou WhatsApp)`;
 
     try {
       await this.limiter.throttle();

@@ -29,9 +29,9 @@ Rate limit: 40 RPM (sliding window). Sem key: fallback textual.
 
 ## Integrações externas
 
-- **Anthropic Claude API** — sugestão de filtros, geração de domínios, validação de sites
-- **Google Places API** — websiteUri, telefone, rating, endereço (timeout 8s)
-- **Web scraping próprio** — HEAD/GET com User-Agent `PIE-bot/1.0`, timeout 6-8s
+- **Anthropic Claude API** — sugestão de filtros por linguagem natural (Sonnet), geração de domínios candidatos e validação de site (Haiku)
+- **Google Places API** (`GOOGLE_PLACES_API_KEY`) — usada na Fase 1 do enriquecimento de site; retorna `websiteUri`, telefone, rating, nº avaliações, status do negócio e endereço. Timeout 8s. Sem key: etapa pulada.
+- **Web scraping próprio** — HEAD/GET com User-Agent `PIE-bot/1.0`, timeout 6-8s; extrai title, description, links de redes sociais e WhatsApp
 
 ## GCP
 

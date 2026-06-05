@@ -1,8 +1,9 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname } from 'next/navigation';
+import { usePathname, useRouter } from 'next/navigation';
 import { useState } from 'react';
+import { useAuth } from '../contexts/AuthContext';
 
 type NavItem = { href: string; label: string; icon: string };
 
@@ -66,6 +67,8 @@ const BASE_PRIMARIA_PATHS = [
 
 export default function Sidebar() {
   const pathname = usePathname();
+  const router = useRouter();
+  const { logout } = useAuth();
   const [openGroups, setOpenGroups] = useState<Record<string, boolean>>({
     'Base Primária': BASE_PRIMARIA_PATHS.some((p) => pathname.startsWith(p)),
     'Organização': pathname.startsWith('/organizacao'),
@@ -152,6 +155,13 @@ export default function Sidebar() {
       <div className="px-3 pb-4">
         <div className="border-t border-white/10 pt-3 flex flex-col gap-1">
           {navBottom.map(renderEntry)}
+          <button
+            onClick={() => { logout(); router.replace('/login'); }}
+            className="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-white/40 hover:bg-white/8 hover:text-white transition-colors w-full text-left"
+          >
+            <span className="text-base">↩</span>
+            Sair
+          </button>
         </div>
       </div>
     </aside>

@@ -6,6 +6,7 @@ import { BigQueryService } from '../base-primaria/bigquery.service';
 import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
 import { AddressEnriquecimento, AddressStatus } from './entities/address-enriquecimento.entity';
 import { ContactEnriquecimento, ContactQuality } from './entities/contact-enriquecimento.entity';
+import { SocioEnriquecimento } from './entities/socio-enriquecimento.entity';
 import { EnrichmentData, EnrichmentConfidence, EnrichmentSource } from './entities/enrichment-data.entity';
 import { AiService } from '../ai/ai.service';
 
@@ -680,6 +681,66 @@ function detectContact(params: {
   };
 }
 
+// ── Módulo 4 — Sócio: helpers ────────────────────────────────────────────────
+
+// Códigos RF de qualificação de sócio decisor (administrador, diretor, presidente)
+const DECISOR_QUALIFICACOES = new Set([
+  '05', '5',   // Administrador
+  '08', '8',   // Diretor
+  '10',        // Presidente
+  '16',        // Procurador
+  '17',        // Representante Legal
+  '20',        // Sócio-Gerente
+  '49',        // Sócio-Administrador
+  '50',        // Sócio-Ostensivo
+  '54',        // Fundador
+  '65',        // Titular PF residente no país
+  '78',        // Titular PF residente no exterior
+]);
+
+function isDecisor(qualificacao: string): boolean {
+  return DECISOR_QUALIFICACOES.has(qualificacao?.trim());
+}
+
+function extractDomain(siteUrl: string): string | undefined {
+  try {
+    const { hostname } = new URL(siteUrl);
+    return hostname.startsWith('www.') ? hostname.slice(4) : hostname;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeName(name: string): string {
+  return name
+    .toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/[^a-z ]/g, '')
+    .trim();
+}
+
+function gerarEmailCandidatos(nomeCompleto: string, domain: string): string[] {
+  if (!nomeCompleto?.trim() || !domain?.trim()) return [];
+
+  const parts = normalizeName(nomeCompleto).split(' ').filter(w => w.length > 1);
+  if (!parts.length) return [];
+
+  const primeiro  = parts[0];
+  const segundo   = parts[1] ?? '';
+  const ultimo    = parts[parts.length - 1];
+  const inicial   = primeiro[0];
+
+  const candidates = [
+    `${primeiro}@${domain}`,
+    segundo ? `${primeiro}.${segundo}@${domain}` : '',
+    ultimo !== primeiro ? `${primeiro}.${ultimo}@${domain}` : '',
+    segundo ? `${inicial}.${segundo}@${domain}` : '',
+    ultimo !== primeiro ? `${inicial}.${ultimo}@${domain}` : '',
+  ].filter(Boolean);
+
+  return [...new Set(candidates)];
+}
+
 // ── Mapeamento enrichment_data ↔ campos de presença digital ──────────────────
 
 type DigitalFields = {
@@ -745,6 +806,8 @@ export class EnriquecimentoService {
     private readonly addressRepo: Repository<AddressEnriquecimento>,
     @InjectRepository(ContactEnriquecimento)
     private readonly contactRepo: Repository<ContactEnriquecimento>,
+    @InjectRepository(SocioEnriquecimento)
+    private readonly socioRepo: Repository<SocioEnriquecimento>,
     @InjectRepository(EnrichmentData)
     private readonly enrichmentRepo: Repository<EnrichmentData>,
   ) {
@@ -1567,6 +1630,168 @@ export class EnriquecimentoService {
       this.contactRepo.count({ where: { recorteId, contactQuality: 'third_party' } }),
     ]);
     return { data, total, direct, third_party, not_found: total - direct - third_party };
+  }
+
+  // ── Módulo 4 — Sócio ────────────────────────────────────────────────────────
+
+  async enrichSocioBatch(
+    recorteId: number,
+    onProgress: (done: number, total: number, comCandidate: number) => void,
+  ): Promise<{ total: number; com_candidato: number; sem_candidato: number }> {
+    const recorte = await this.recortes.findOne(recorteId);
+    const clauses = this.recortes.buildWhere(recorte.filtros);
+    const from    = this.recortes.buildFrom();
+    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    // ── 1. BQ: JOIN estabelecimentos (recorte) com socios ─────────────────────
+    //    Prioriza decisores (administrador, diretor, presidente) por CNPJ
+    const sociosTable = this.bq.table('socios');
+    const bqRows = await this.bq.query<{
+      cnpj: string; socio_nome: string; qualificacao: string; data_entrada: string;
+    }>(`
+      SELECT
+        TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
+        COALESCE(TRIM(s.nome_socio), '')           AS socio_nome,
+        COALESCE(TRIM(s.qualificacao_socio), '')   AS qualificacao,
+        COALESCE(TRIM(s.data_entrada_sociedade), '') AS data_entrada
+      FROM ${from}
+      JOIN ${sociosTable} s ON TRIM(s.cnpj_basico) = TRIM(e.cnpj_basico)
+      ${where}
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv
+        ORDER BY
+          CASE WHEN TRIM(s.qualificacao_socio) IN (
+            '05','5','08','8','10','16','17','20','49','50','54','65','78'
+          ) THEN 0 ELSE 1 END ASC,
+          s.data_entrada_sociedade DESC
+      ) = 1
+    `);
+
+    const total = bqRows.length;
+    if (!total) return { total: 0, com_candidato: 0, sem_candidato: 0 };
+
+    // ── 2. Bulk read: site_url de enrichment_data (module='digital') ──────────
+    const cnpjList = bqRows.map(r => r.cnpj);
+    const siteRows = await this.enrichmentRepo
+      .createQueryBuilder('ed')
+      .where('ed.cnpj IN (:...cnpjs)', { cnpjs: cnpjList })
+      .andWhere('ed.module = :module', { module: 'digital' })
+      .andWhere('ed.field_name = :field', { field: 'site_url' })
+      .andWhere('ed.status = :status', { status: 'valid' })
+      .getMany();
+
+    const siteMap = new Map<string, string>();
+    for (const r of siteRows) {
+      if (r.fieldValue) siteMap.set(r.cnpj, r.fieldValue);
+    }
+
+    // ── 3. Skip CNPJs já processados ─────────────────────────────────────────
+    const done_records = await this.socioRepo.find({
+      where: { recorteId },
+      select: ['cnpj', 'hasCandidate'],
+    });
+    const doneSet        = new Set(done_records.map(r => r.cnpj));
+    let doneComCandidate = done_records.filter(r => r.hasCandidate).length;
+    const pending        = bqRows.filter(r => !doneSet.has(r.cnpj));
+
+    let done = doneSet.size;
+    if (done > 0) onProgress(done, total, doneComCandidate);
+
+    // ── 4. Geração de candidatos em memória + gravação em lote ───────────────
+    const BATCH = 200;
+    for (let i = 0; i < pending.length; i += BATCH) {
+      const chunk = pending.slice(i, i + BATCH);
+      const socioRecords: SocioEnriquecimento[] = [];
+      const enrichmentRows: object[] = [];
+
+      for (const r of chunk) {
+        const siteUrl  = siteMap.get(r.cnpj);
+        const domain   = siteUrl ? extractDomain(siteUrl) : undefined;
+        const candidatos = domain ? gerarEmailCandidatos(r.socio_nome, domain) : [];
+        const melhorCandidate = candidatos[0];
+        const hasCandidate   = candidatos.length > 0;
+
+        // Job tracking
+        socioRecords.push(this.socioRepo.create({
+          cnpj:                 r.cnpj,
+          recorteId,
+          socioNome:            r.socio_nome || undefined,
+          socioQualificacao:    r.qualificacao || undefined,
+          socioEmailCandidate:  melhorCandidate,
+          socioEmailConfidence: 'low',
+          hasCandidate,
+          lgpdBasis:            'legitimate_interest',
+          dnc:                  false,
+        }));
+
+        // enrichment_data rows (module='socio')
+        const fields: Array<{ fieldName: string; fieldValue?: string }> = [
+          { fieldName: 'socio_nome',             fieldValue: r.socio_nome || undefined },
+          { fieldName: 'socio_qualificacao',     fieldValue: r.qualificacao || undefined },
+          { fieldName: 'socio_email_candidate',  fieldValue: melhorCandidate },
+          { fieldName: 'socio_email_confidence', fieldValue: 'low' },
+          { fieldName: 'socio_lgpd_basis',       fieldValue: 'legitimate_interest' },
+          { fieldName: 'socio_dnc',              fieldValue: 'false' },
+          // raw_payload com todos os candidatos gravado separadamente
+          { fieldName: 'socio_email_candidates_json', fieldValue: candidatos.length ? JSON.stringify(candidatos) : undefined },
+        ];
+
+        for (const f of fields) {
+          enrichmentRows.push({
+            cnpj:       r.cnpj,
+            module:     'socio',
+            fieldName:  f.fieldName,
+            fieldValue: f.fieldValue ?? undefined,
+            source:     'rf',
+            confidence: f.fieldName === 'socio_email_candidate' ? 'low' : 'high',
+            status:     'valid',
+            enrichedAt: new Date(),
+          });
+        }
+      }
+
+      await this.socioRepo.save(socioRecords);
+      await this.enrichmentRepo
+        .createQueryBuilder()
+        .insert()
+        .into(EnrichmentData)
+        .values(enrichmentRows)
+        .orUpdate(
+          ['field_value', 'source', 'confidence', 'enriched_at'],
+          ['cnpj', 'module', 'field_name', 'status'],
+        )
+        .execute();
+
+      done += chunk.length;
+      doneComCandidate += socioRecords.filter(r => r.hasCandidate).length;
+      onProgress(done, total, doneComCandidate);
+    }
+
+    return {
+      total,
+      com_candidato:  doneComCandidate,
+      sem_candidato:  total - doneComCandidate,
+    };
+  }
+
+  async getSocioEnriquecimento(
+    recorteId: number,
+    page = 1,
+    limit = 50,
+  ): Promise<{
+    data: SocioEnriquecimento[];
+    total: number;
+    com_candidato: number;
+    sem_candidato: number;
+  }> {
+    const [data, total] = await this.socioRepo.findAndCount({
+      where: { recorteId },
+      order: { hasCandidate: 'DESC', enriquecidoEm: 'DESC' },
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+    const com_candidato = await this.socioRepo.count({ where: { recorteId, hasCandidate: true } });
+    return { data, total, com_candidato, sem_candidato: total - com_candidato };
   }
 
   async getSiteMap(recorteId: number): Promise<Map<string, PresencaDigital>> {

@@ -1,5 +1,6 @@
 'use client';
 
+import Image from 'next/image';
 import { FormEvent, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '../contexts/AuthContext';
@@ -27,26 +28,30 @@ export default function LoginPage() {
   }
 
   return (
-    <div
-      className="min-h-screen flex items-center justify-end bg-cover bg-center bg-no-repeat"
-      style={{ backgroundImage: "url('/bg.png')" }}
-    >
-      {/* overlay escuro para contraste */}
+    <div className="relative min-h-screen flex items-center justify-center">
+      {/* background */}
+      <Image
+        src="/bg.png"
+        alt=""
+        fill
+        priority
+        className="object-cover object-center"
+      />
+      {/* overlay */}
       <div className="absolute inset-0 bg-[#0a0f1e]/60" />
 
-      <div className="relative z-10 w-full max-w-sm mr-16 flex flex-col gap-6">
-        {/* logo */}
-        <div className="text-left px-1">
+      {/* conteúdo */}
+      <div className="relative z-10 w-full max-w-sm flex flex-col gap-6 px-4">
+        <div className="text-center">
           <span className="text-white font-bold text-3xl tracking-widest">PIE</span>
           <p className="text-white/50 text-sm mt-1">Plataforma de Inteligência Comercial</p>
         </div>
 
-        {/* card */}
         <form
           onSubmit={handleSubmit}
           className="bg-white/10 backdrop-blur-md border border-white/20 rounded-2xl px-8 py-8 flex flex-col gap-5 shadow-2xl"
         >
-          <h1 className="text-white font-semibold text-lg">Entrar na plataforma</h1>
+          <h1 className="text-white font-semibold text-lg text-center">Entrar na plataforma</h1>
 
           <div className="flex flex-col gap-1.5">
             <label className="text-xs font-medium text-white/60 uppercase tracking-wide">Email</label>

@@ -1352,6 +1352,16 @@ export class EnriquecimentoService {
           record.linkedinUrl  = meta.linkedinUrl;
           record.whatsappUrl  = meta.whatsappUrl;
           await this.siteRepo.save(record);
+          // Sincroniza enrichment_data — mantém source/confidence originais do site_url
+          const existingConf = await this.enrichmentRepo.findOne({
+            where: { cnpj: record.cnpj, module: 'digital', fieldName: 'site_url', status: 'valid' },
+            select: ['source', 'confidence'],
+          });
+          await this.saveDigitalCache(
+            record.cnpj, record,
+            (existingConf?.source ?? 'scraping') as EnrichmentSource,
+            (existingConf?.confidence ?? 'low') as EnrichmentConfidence,
+          );
         }
       }));
       done += batch.length;

@@ -45,7 +45,6 @@ Working language: Portuguese (BR)
 | `receita_federal.socios` | 27,650,926 | `cnpj_basico` |
 
 Query performance: `overview` ~3s, `analise/uf` ~2s, `executar` recorte 1–3s.
-(Was 30–120s with DuckDB.)
 
 ---
 
@@ -56,8 +55,8 @@ Each module follows: `controller + service + entity` pattern.
 | Module | Responsibility |
 |---|---|
 | `base-primaria` | Data Lake Receita Federal via BigQuery; `bigquery.service.ts`, `bigquery-upload.service.ts` (ZIP→GCS→BQ), `base-primaria.service.ts` (analytics stats) |
-| `recortes` | Create/edit segments; `buildWhere()` + `buildFrom()` query builder (returns BQ table ref); filters as JSONB in Neon |
-| `enriquecimento` | Web scraping + Google Places + AI; 30-day cache per CNPJ; Phase 1 (authoritative) + Phase 2 (heuristic+AI); SSE progress stream |
+| `recortes` | Create/edit segments; `buildWhere()` + `buildFrom()` + `buildEmpresasJoin()` query builder (returns BQ table refs); filters as JSONB in Neon |
+| `enriquecimento` | 5 enrichment modules + phone classification; see §14 for full architecture |
 | `ai` | Anthropic SDK; `sugerirFiltros` (Sonnet), `gerarCandidatosSite` + `validarSite` (Haiku); RateLimiter 40 RPM |
 | `leads` | Lead per recorte (cnpj + status + notes); UNIQUE(cnpj, recorteId) |
 | `opportunities` | Sales pipeline; stages: `novo → contato → qualificado → proposta → sell_out` |
@@ -102,50 +101,51 @@ Rate limit: 40 RPM (sliding window). No key: graceful textual fallback.
 
 ---
 
-## 7. ENRICHMENT MODULE (enriquecimento.service.ts)
+## 7. ENRICHMENT MODULE — ARCHITECTURE (v1 — Junho 2026)
 
-Two independent enrichment flows:
+Referência: `PIE_Enriquecimento_Arquitetura_v1.pdf` · Detalhes: `docs/enriquecimento.md`
 
-### Phone enrichment
-Classifies BigQuery data with no external calls:
-- `celular` — 9 digits starting with 9
-- `fixo` — 8 digits
-- `invalido` — invalid DDD or format
-- `sem_telefone` — empty field
+### Fluxo recomendado de execução
 
-### Site enrichment
-Batch, concurrency 8, two cascading phases:
+```
+Módulo 1 (Endereço) → Módulos 2, 3, 4 (paralelos) → Módulo 5 (Outbound)
+```
 
-**Phase 1 — Authoritative (no AI, high confidence):**
-1. Corporate email from CNPJ → extract domain (ignores gmail, hotmail, etc.)
-2. Google Places API → `websiteUri` direct
-3. ReclameAqui → tests slugs of the trade name
+Módulo 1 deve rodar primeiro — seus resultados (places_phone, business_status, website_uri)
+alimentam os módulos 2, 3 e 5.
 
-**Phase 2 — Heuristic (only if Phase 1 failed, requires AI validation):**
-1. `AiService.gerarCandidatosSite(nome, cnae, municipio, uf)` → up to 5 domains (Haiku)
-2. `slugCandidates(nome)` → `.com.br` / `.com` variations
-3. Per candidate: `isBannedUrl` → `verifyUrl` → `fetchPageMeta` → `ai.validarSite` (Haiku)
+### Tabelas Neon (enriquecimento)
 
-**What is collected:** URL, slug, Instagram, Facebook, LinkedIn, WhatsApp, ReclameAqui, Google Places (phone, rating, review count, status, address).
+| Tabela | Status | Papel |
+|---|---|---|
+| `enrichment_data` | **ativa** | Fonte de verdade — EAV por (cnpj, module, field_name, status) |
+| `site_enriquecimento` | **ativa (débito)** | Job tracking M3 + campos UI duplicados de enrichment_data |
+| `address_enriquecimento` | **ativa** | Job tracking Módulo 1 |
+| `contact_enriquecimento` | **ativa** | Job tracking Módulo 2 |
+| `socio_enriquecimento` | **ativa** | Job tracking Módulo 4 |
+| `outbound_enriquecimento` | **ativa** | Perfil consolidado Módulo 5 |
 
-**Cache:** `cnpj_site_cache` — global per CNPJ, TTL 30 days (via `SITE_CACHE_TTL_DAYS`). Safe batch restart.
+### Módulos implementados
 
-**Banned URL filter (`isBannedUrl`):** Rejects `.gov.br`, `prefeitura.*`, `camara.leg.*`, iFood, Rappi, Uber Eats, TripAdvisor, Foursquare, GuiaMais, TeleListas, Encontra.
-Applied before `verifyUrl` AND after (catches redirects).
+| Módulo | Endpoint | Custo estimado por batch |
+|---|---|---|
+| Telefone | `POST /telefone` | Grátis (só BQ) |
+| 1 — Endereço | `POST /endereco` | ~$0.017–0.05/CNPJ (Places API) |
+| 2 — Contato PJ | `POST /contato` | ~$0.01–0.05 BQ, zero API externa |
+| 3 — Presença Digital | `POST /site` | Places + AI Haiku (Fase 2) |
+| 4 — Sócio | `POST /socio` | ~$0.10–0.50 BQ (JOIN socios 27M), zero API |
+| 5 — Outbound-Ready | `POST /outbound` | ~$0.01–0.05 BQ, zero API |
 
-**`validarSite` rejects if:**
-- Government / public agency site
-- Delivery app, marketplace, or directory
-- Activity incompatible with CNAE
-- Homonymous company in different UF
-- No direct contact method (phone, email, or WhatsApp)
+### Site enrichment — comportamento de travamento
+
+O batch de site (Módulo 3) usa SSE com concorrência 8. Se a conexão SSE cair (timeout Railway ~5min, browser fechado, etc.), o batch interrompe mas **não perde progresso** — CNPJs já processados ficam salvos. Basta reprocessar: o batch detecta o doneSet e retoma de onde parou.
 
 ---
 
 ## 8. MAIN USER FLOW
 
 ```
-Segmento (filtros multi-critério) → Enriquecimento → Leads → Oportunidades
+Segmento (filtros multi-critério) → Enriquecimento (módulos 1–5) → Leads → Oportunidades
 ```
 
 - **Segmentos:** CNAE, UF, situação cadastral, porte, capital, município, bairro — filters stored as JSONB in Neon, executed against BigQuery
@@ -167,15 +167,14 @@ GOOGLE_APPLICATION_CREDENTIALS_JSON={...service account JSON...}
 DATABASE_URL=postgresql://...@...neon.tech/neondb?sslmode=require
 NODE_ENV=production
 PORT=3001
+SITE_CACHE_TTL_DAYS=30          # TTL do cache enrichment_data (padrão: 30 dias)
+CONTACT_SHARED_THRESHOLD=5      # Módulo 2: limiar de contato compartilhado
 ```
 
 **Local dev:**
 ```env
 # frontend/.env.local
 NEXT_PUBLIC_API_URL=http://localhost:3001
-
-# backend: PostgreSQL local via Docker Compose
-# pie/pie@127.0.0.1:5432/pie
 ```
 
 > ⚠️ `GOOGLE_APPLICATION_CREDENTIALS_JSON` — never commit. In `.gitignore`.
@@ -198,9 +197,10 @@ Expected warnings in `estabelecimentos` load: missing columns on short lines + A
 ## 11. IMPORTANT CAVEATS
 
 - `estabelecimentos` local table (5.3 GB) was NOT migrated to Neon — data lives in BigQuery only
-- Neon holds only transactional data (~5 MB): recortes, leads, oportunidades, enrichment cache, reference tables
+- Neon holds only transactional data (~5 MB): recortes, leads, oportunidades, enrichment tables, reference tables
 - When importing data to Neon, always use `psql -f` INSIDE Docker container — `Get-Content | docker exec` corrupts accents on Windows PowerShell
 - Frontend backend URL hardcoded as fallback — if changing prod URL, update `frontend/src/services/api.ts` and all page files
+- Neon project: **old-moon-87436264**
 
 ---
 
@@ -227,42 +227,34 @@ Expected warnings in `estabelecimentos` load: missing columns on short lines + A
 
 ---
 
-## 14. ARQUITETURA DE ENRIQUECIMENTO (v1 — Junho 2026)
+## 14. DÉBITOS TÉCNICOS — ENRIQUECIMENTO
 
-Referência: `PIE_Enriquecimento_Arquitetura_v1.pdf`
+### Débitos ativos
 
-### Tabelas Neon (enriquecimento)
+| # | Débito | Impacto | Esforço |
+|---|---|---|---|
+| 1 | `site_enriquecimento` campos de dados duplicam `enrichment_data` | Dados escritos 2x; UI lê da tabela errada | Médio |
+| 2 | Fase 1 Módulo 3 sem multi-âncora | Places websiteUri aceito sem verificar telefone/endereço no site | Baixo |
+| 3 | Feedback pós-contato sem endpoint/UI | Usuário não consegue sinalizar dado errado (PDF §2.3) | Alto valor |
+| 4 | Instagram/Facebook buscados só se aparecem no site | Busca ativa por nome+município não implementada (PDF §5.4.2/5.4.3) | Alto esforço |
+| 5 | LinkedIn Sócio (Fase 5) | Requer Apify — não implementado | Fase futura |
+| 6 | Export XLSX por canal | `GET /outbound/export` retorna JSON; PDF §7.4 prevê XLSX com abas | Frontend |
+| 7 | `shared_multiple_cnpjs` limitado ao recorte | Cross-recorte requer tabela BQ pré-computada (~$3–5/mês) | Futuro |
 
-| Tabela | Status | Papel |
-|---|---|---|
-| `enrichment_data` | **ativa** | Fonte de verdade — EAV por (cnpj, module, field_name, status) |
-| `site_enriquecimento` | **ativa com débito** | Job tracking por (cnpj, recorteId); campos de dados são duplicatas |
-| `cnpj_site_cache` | **órfã — dropar** | Substituída por `enrichment_data`; tabela existe no Neon mas não é usada |
+### Débito 1 — como resolver
 
-### Módulos implementados
+```
+1. Migrar getSiteEnriquecimento() para pivotar de enrichment_data
+2. Migrar getSiteMap() idem
+3. Remover colunas de dados de site_enriquecimento.entity.ts
+   (manter apenas: id, cnpj, recorteId, status, enriquecidoEm)
+```
 
-| Módulo | Código | Status |
-|---|---|---|
-| Módulo 3 — Presença Digital | `enriquecimento.service.ts` | Implementado; escreve em `enrichment_data` (module='digital') |
-| Módulo telefone | `enriquecimento.service.ts` | Implementado; classifica via BigQuery sem tabela Neon |
+### Débito 3 — como resolver (feedback pós-contato)
 
-### Módulos pendentes (ver PDF §§3–7)
-
-| Módulo | Descrição resumida |
-|---|---|
-| Módulo 1 — Endereço | Places com query em cascata + score multi-âncora (endereço/telefone/CNAE/nome) |
-| Módulo 2 — Contato PJ | Detectar telefone/email de contador; propor contato direto alternativo |
-| Módulo 4 — Sócio | Enriquecer `receita_federal.socios` (BQ); email por padrão de domínio; LGPD |
-| Módulo 5 — Outbound-Ready | Perfil consolidado; canal score ALTO/MÉDIO/INVIÁVEL; export CSV/XLSX/JSON |
-
-### Débitos técnicos no código atual
-
-1. **`site_enriquecimento` campos de dados** — `url`, `instagramUrl`, `googlePhone`, etc. são duplicados de `enrichment_data` para compatibilidade da UI. Migrar `getSiteEnriquecimento` e `getSiteMap` para ler de `enrichment_data` e remover esses campos da entity.
-
-2. **`cnpj_site_cache` no Neon** — tabela órfã, pode ser dropada com: `DROP TABLE public.cnpj_site_cache;`
-
-3. **Confiança do Places na Fase 1** — `google_*` fields sempre `high`, mas `site_url` via Places (`urlConfidence = 'high'`) não verifica âncoras adicionais (§5.3 do PDF). Implementar score multi-âncora no Módulo 1.
-
-4. **Feedback pós-contato** — `invalidation_reason` existe em `enrichment_data` mas não há endpoint nem UI para o usuário sinalizar dado errado (§2.3 do PDF).
-
-5. **`getSiteEnriquecimento` lê de `site_enriquecimento`** — após migrar, esse método deve pivotar de `enrichment_data` e deixar `site_enriquecimento` apenas com colunas de job tracking (cnpj, recorteId, status, enriquecidoEm).
+```
+PATCH /enriquecimento/:cnpj/invalidar
+Body: { module, fieldName, invalidationReason }
+→ chama invalidateDigitalCache() já existente no service
+→ UI: botão "Dado incorreto" na tabela de resultados
+```

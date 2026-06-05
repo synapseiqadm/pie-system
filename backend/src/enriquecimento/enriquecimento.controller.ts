@@ -215,4 +215,57 @@ export class EnriquecimentoController {
       limit ? Number(limit) : 50,
     );
   }
+
+  // ── Outbound-Ready ──────────────────────────────────────────────────────────
+
+  // POST /enriquecimento/:recorteId/outbound — consolida perfil com SSE progress
+  @Post(':recorteId/outbound')
+  async enrichOutbound(@Param('recorteId') id: string, @Res() res: Response) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    try {
+      const stats = await this.service.enrichOutboundBatch(
+        Number(id),
+        (done, total) => {
+          sse(res, { stage: 'progresso', done, total });
+        },
+      );
+      sse(res, { stage: 'concluido', ...stats });
+    } catch (err: any) {
+      sse(res, { stage: 'erro', detail: err?.message ?? 'Erro desconhecido' });
+    }
+
+    res.end();
+  }
+
+  // GET /enriquecimento/:recorteId/outbound?page=1&limit=50&minScore=50&emailScore=alto
+  @Get(':recorteId/outbound')
+  browseOutbound(
+    @Param('recorteId') id: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+    @Query('minScore') minScore?: string,
+    @Query('emailScore') emailScore?: string,
+    @Query('whatsappScore') whatsappScore?: string,
+    @Query('sdrScore') sdrScore?: string,
+  ) {
+    return this.service.getOutboundEnriquecimento(
+      Number(id),
+      page ? Number(page) : 1,
+      limit ? Number(limit) : 50,
+      minScore ? Number(minScore) : undefined,
+      emailScore as any,
+      whatsappScore as any,
+      sdrScore as any,
+    );
+  }
+
+  // GET /enriquecimento/:recorteId/outbound/export — JSON completo, exclui DNC
+  @Get(':recorteId/outbound/export')
+  exportOutbound(@Param('recorteId') id: string) {
+    return this.service.exportOutbound(Number(id));
+  }
 }

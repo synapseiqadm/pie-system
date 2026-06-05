@@ -7,6 +7,7 @@ import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
 import { AddressEnriquecimento, AddressStatus } from './entities/address-enriquecimento.entity';
 import { ContactEnriquecimento, ContactQuality } from './entities/contact-enriquecimento.entity';
 import { SocioEnriquecimento } from './entities/socio-enriquecimento.entity';
+import { OutboundEnriquecimento, CanalScore } from './entities/outbound-enriquecimento.entity';
 import { EnrichmentData, EnrichmentConfidence, EnrichmentSource } from './entities/enrichment-data.entity';
 import { AiService } from '../ai/ai.service';
 
@@ -741,6 +742,148 @@ function gerarEmailCandidatos(nomeCompleto: string, domain: string): string[] {
   return [...new Set(candidates)];
 }
 
+// ── Módulo 5 — Outbound-Ready: helpers ───────────────────────────────────────
+
+type EnrichField = { value?: string; confidence: string };
+type EnrichMap   = Map<string, EnrichField>; // chave: "module:field_name"
+
+function ef(map: EnrichMap, module: string, field: string): EnrichField | undefined {
+  return map.get(`${module}:${field}`);
+}
+
+function extractWhatsappNumber(url: string): string | undefined {
+  return url.match(/(\d{10,13})/)?.[1];
+}
+
+type OutboundProfile = {
+  phoneBest?: string;
+  phoneBestSource?: string;
+  emailBest?: string;
+  emailBestSource?: string;
+  whatsappNumber?: string;
+  isOperational?: boolean;
+  addressOperational?: string;
+  siteUrl?: string;
+  instagramUrl?: string;
+  linkedinCompanyUrl?: string;
+  socioNome?: string;
+  socioEmailCandidate?: string;
+  emailScore: CanalScore;
+  whatsappScore: CanalScore;
+  sdrScore: CanalScore;
+  linkedinScore: CanalScore;
+  outboundScore: number;
+};
+
+function consolidateProfile(
+  rfPhone: string,
+  rfEmail: string,
+  fields: EnrichMap,
+): OutboundProfile {
+  // ── Leitura dos campos necessários ──────────────────────────────────────────
+  const phoneDirect     = ef(fields, 'contact', 'phone_direct');
+  const phoneDirectSrc  = ef(fields, 'contact', 'phone_direct_source')?.value;
+  const phoneIsThird    = ef(fields, 'contact', 'phone_is_third_party')?.value;
+  const emailCorporate  = ef(fields, 'contact', 'email_corporate');
+  const emailIsThird    = ef(fields, 'contact', 'email_is_third_party')?.value;
+  const placesPhone     = ef(fields, 'address', 'places_phone')?.value;
+  const businessStatus  = ef(fields, 'address', 'business_status')?.value;
+  const addressPlaces   = ef(fields, 'address', 'address_places')?.value;
+  const siteEntry       = ef(fields, 'digital', 'site_url');
+  const instagramUrl    = ef(fields, 'digital', 'instagram_url')?.value;
+  const linkedinUrl     = ef(fields, 'digital', 'linkedin_url')?.value;
+  const whatsappUrl     = ef(fields, 'digital', 'whatsapp_url')?.value;
+  const socioNome       = ef(fields, 'socio',   'socio_nome')?.value;
+  const socioEmail      = ef(fields, 'socio',   'socio_email_candidate')?.value;
+
+  // ── phone_best (§7.2) ───────────────────────────────────────────────────────
+  let phoneBest: string | undefined;
+  let phoneBestSource: string | undefined;
+
+  if (phoneDirect?.value) {
+    phoneBest = phoneDirect.value;
+    phoneBestSource = phoneDirectSrc;
+  } else if (phoneIsThird !== 'true' && rfPhone) {
+    phoneBest = rfPhone;
+    phoneBestSource = 'rf';
+  } else if (placesPhone) {
+    phoneBest = placesPhone;
+    phoneBestSource = 'places';
+  }
+
+  // ── email_best (§7.2) ───────────────────────────────────────────────────────
+  let emailBest: string | undefined;
+  let emailBestSource: string | undefined;
+
+  if (emailCorporate?.value) {
+    emailBest = emailCorporate.value;
+    emailBestSource = 'scraping';
+  } else if (emailIsThird !== 'true' && rfEmail) {
+    emailBest = rfEmail;
+    emailBestSource = 'rf';
+  }
+
+  const isOperational      = businessStatus === 'OPERATIONAL';
+  const addressOperational = (addressPlaces && ['high','medium'].includes(ef(fields,'address','address_places')?.confidence ?? ''))
+    ? addressPlaces : undefined;
+
+  const siteUrl = (siteEntry?.value && ['high','medium'].includes(siteEntry.confidence))
+    ? siteEntry.value : undefined;
+
+  const whatsappNumber = whatsappUrl ? extractWhatsappNumber(whatsappUrl) : undefined;
+
+  // ── Canal scores (§7.3) ─────────────────────────────────────────────────────
+  let emailScore: CanalScore = 'inviavel';
+  if (emailCorporate?.value && ['high','medium'].includes(emailCorporate.confidence)) {
+    emailScore = 'alto';
+  } else if (emailBest && emailBestSource === 'rf') {
+    emailScore = 'medio';
+  }
+
+  let whatsappScore: CanalScore = 'inviavel';
+  if (whatsappNumber) {
+    whatsappScore = isOperational ? 'alto' : 'medio';
+  }
+
+  let sdrScore: CanalScore = 'inviavel';
+  if (
+    phoneDirect?.value &&
+    ['high','medium'].includes(phoneDirect.confidence) &&
+    isOperational
+  ) {
+    sdrScore = 'alto';
+  } else if (phoneBest && phoneIsThird !== 'true') {
+    sdrScore = 'medio';
+  }
+
+  const linkedinScore: CanalScore = linkedinUrl ? 'medio' : 'inviavel';
+
+  // ── outbound_score 0–100 ────────────────────────────────────────────────────
+  let outboundScore = 0;
+  if (emailScore === 'alto')      outboundScore += 30;
+  else if (emailScore === 'medio') outboundScore += 15;
+  if (whatsappScore === 'alto')      outboundScore += 25;
+  else if (whatsappScore === 'medio') outboundScore += 12;
+  if (sdrScore === 'alto')      outboundScore += 25;
+  else if (sdrScore === 'medio') outboundScore += 12;
+  if (linkedinScore === 'medio') outboundScore += 20;
+
+  return {
+    phoneBest, phoneBestSource,
+    emailBest, emailBestSource,
+    whatsappNumber,
+    isOperational,
+    addressOperational,
+    siteUrl,
+    instagramUrl,
+    linkedinCompanyUrl: linkedinUrl,
+    socioNome,
+    socioEmailCandidate: socioEmail,
+    emailScore, whatsappScore, sdrScore, linkedinScore,
+    outboundScore,
+  };
+}
+
 // ── Mapeamento enrichment_data ↔ campos de presença digital ──────────────────
 
 type DigitalFields = {
@@ -808,6 +951,8 @@ export class EnriquecimentoService {
     private readonly contactRepo: Repository<ContactEnriquecimento>,
     @InjectRepository(SocioEnriquecimento)
     private readonly socioRepo: Repository<SocioEnriquecimento>,
+    @InjectRepository(OutboundEnriquecimento)
+    private readonly outboundRepo: Repository<OutboundEnriquecimento>,
     @InjectRepository(EnrichmentData)
     private readonly enrichmentRepo: Repository<EnrichmentData>,
   ) {
@@ -1792,6 +1937,210 @@ export class EnriquecimentoService {
     });
     const com_candidato = await this.socioRepo.count({ where: { recorteId, hasCandidate: true } });
     return { data, total, com_candidato, sem_candidato: total - com_candidato };
+  }
+
+  // ── Módulo 5 — Outbound-Ready ────────────────────────────────────────────────
+
+  async enrichOutboundBatch(
+    recorteId: number,
+    onProgress: (done: number, total: number) => void,
+  ): Promise<{ total: number; alto: number; medio: number; inviavel: number }> {
+    const recorte = await this.recortes.findOne(recorteId);
+    const clauses = this.recortes.buildWhere(recorte.filtros);
+    const from    = this.recortes.buildFrom();
+    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    // ── 1. BQ: RF phone + email (dados brutos da Receita) ────────────────────
+    const bqRows = await this.bq.query<{
+      cnpj: string; rf_phone: string; rf_email: string;
+    }>(`
+      SELECT
+        TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
+        CONCAT(COALESCE(TRIM(e.ddd_1),''), COALESCE(TRIM(e.telefone_1),'')) AS rf_phone,
+        COALESCE(TRIM(e.correio_eletronico), '') AS rf_email
+      FROM ${from}
+      ${where}
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
+    `);
+
+    const total = bqRows.length;
+    if (!total) return { total: 0, alto: 0, medio: 0, inviavel: 0 };
+
+    const rfMap = new Map<string, { rfPhone: string; rfEmail: string }>();
+    for (const r of bqRows) rfMap.set(r.cnpj, { rfPhone: r.rf_phone, rfEmail: r.rf_email });
+
+    // ── 2. Bulk read enrichment_data — só campos necessários p/ consolidação ──
+    const cnpjList    = bqRows.map(r => r.cnpj);
+    const neededFields = [
+      'phone_direct', 'phone_direct_source', 'phone_is_third_party',
+      'email_corporate', 'email_is_third_party',
+      'business_status', 'places_phone', 'address_places',
+      'site_url', 'instagram_url', 'linkedin_url', 'whatsapp_url',
+      'socio_nome', 'socio_email_candidate',
+    ];
+
+    const enrichRows = await this.enrichmentRepo
+      .createQueryBuilder('ed')
+      .where('ed.cnpj IN (:...cnpjs)', { cnpjs: cnpjList })
+      .andWhere('ed.module IN (:...modules)', { modules: ['contact','address','digital','socio'] })
+      .andWhere('ed.field_name IN (:...fields)', { fields: neededFields })
+      .andWhere('ed.status = :status', { status: 'valid' })
+      .getMany();
+
+    // Indexar: cnpj → EnrichMap
+    const enrichIndex = new Map<string, EnrichMap>();
+    for (const r of enrichRows) {
+      if (!enrichIndex.has(r.cnpj)) enrichIndex.set(r.cnpj, new Map());
+      enrichIndex.get(r.cnpj)!.set(`${r.module}:${r.fieldName}`, {
+        value:      r.fieldValue ?? undefined,
+        confidence: r.confidence,
+      });
+    }
+
+    // ── 3. Skip CNPJs já processados ─────────────────────────────────────────
+    const done_records = await this.outboundRepo.find({
+      where: { recorteId },
+      select: ['cnpj', 'outboundScore'],
+    });
+    const doneSet = new Set(done_records.map(r => r.cnpj));
+    const pending = bqRows.filter(r => !doneSet.has(r.cnpj));
+
+    let done = doneSet.size;
+    if (done > 0) onProgress(done, total);
+
+    // ── 4. Consolidação em memória + gravação em lote ─────────────────────────
+    const BATCH = 200;
+    let alto = 0, medio = 0, inviavel = 0;
+
+    for (let i = 0; i < pending.length; i += BATCH) {
+      const chunk = pending.slice(i, i + BATCH);
+      const outboundRecords: OutboundEnriquecimento[] = [];
+      const enrichmentRows: object[] = [];
+
+      for (const r of chunk) {
+        const rf     = rfMap.get(r.cnpj) ?? { rfPhone: '', rfEmail: '' };
+        const fields = enrichIndex.get(r.cnpj) ?? new Map();
+        const prof   = consolidateProfile(rf.rfPhone, rf.rfEmail, fields);
+
+        outboundRecords.push(this.outboundRepo.create({
+          cnpj: r.cnpj, recorteId,
+          ...prof,
+        }));
+
+        // enrichment_data (module='outbound')
+        const outFields: Array<[string, string | undefined]> = [
+          ['phone_best',             prof.phoneBest],
+          ['phone_best_source',      prof.phoneBestSource],
+          ['email_best',             prof.emailBest],
+          ['email_best_source',      prof.emailBestSource],
+          ['whatsapp_number',        prof.whatsappNumber],
+          ['is_operational',         prof.isOperational?.toString()],
+          ['address_operational',    prof.addressOperational],
+          ['site_url',               prof.siteUrl],
+          ['instagram_url',          prof.instagramUrl],
+          ['linkedin_company_url',   prof.linkedinCompanyUrl],
+          ['socio_nome',             prof.socioNome],
+          ['socio_email_candidate',  prof.socioEmailCandidate],
+          ['email_score',            prof.emailScore],
+          ['whatsapp_score',         prof.whatsappScore],
+          ['sdr_score',              prof.sdrScore],
+          ['linkedin_score',         prof.linkedinScore],
+          ['outbound_score',         prof.outboundScore.toString()],
+        ];
+
+        for (const [fieldName, fieldValue] of outFields) {
+          enrichmentRows.push({
+            cnpj: r.cnpj, module: 'outbound', fieldName,
+            fieldValue: fieldValue ?? undefined,
+            source: 'rf', confidence: 'high',
+            status: 'valid', enrichedAt: new Date(),
+          });
+        }
+
+        if (prof.outboundScore >= 50)      alto++;
+        else if (prof.outboundScore >= 20) medio++;
+        else                               inviavel++;
+      }
+
+      await this.outboundRepo.save(outboundRecords);
+      await this.enrichmentRepo
+        .createQueryBuilder()
+        .insert()
+        .into(EnrichmentData)
+        .values(enrichmentRows)
+        .orUpdate(
+          ['field_value', 'source', 'confidence', 'enriched_at'],
+          ['cnpj', 'module', 'field_name', 'status'],
+        )
+        .execute();
+
+      done += chunk.length;
+      onProgress(done, total);
+    }
+
+    // Contagem final incluindo já processados
+    const allRecords = await this.outboundRepo.find({
+      where: { recorteId },
+      select: ['outboundScore'],
+    });
+    alto     = allRecords.filter(r => r.outboundScore >= 50).length;
+    medio    = allRecords.filter(r => r.outboundScore >= 20 && r.outboundScore < 50).length;
+    inviavel = allRecords.filter(r => r.outboundScore < 20).length;
+
+    return { total, alto, medio, inviavel };
+  }
+
+  async getOutboundEnriquecimento(
+    recorteId: number,
+    page = 1,
+    limit = 50,
+    minScore?: number,
+    emailScore?: CanalScore,
+    whatsappScore?: CanalScore,
+    sdrScore?: CanalScore,
+  ): Promise<{
+    data: OutboundEnriquecimento[];
+    total: number;
+    alto: number;
+    medio: number;
+    inviavel: number;
+  }> {
+    const qb = this.outboundRepo.createQueryBuilder('ob')
+      .where('ob.recorteId = :recorteId', { recorteId })
+      .orderBy('ob.outboundScore', 'DESC')
+      .addOrderBy('ob.enriquecidoEm', 'DESC');
+
+    if (minScore != null)    qb.andWhere('ob.outboundScore >= :minScore', { minScore });
+    if (emailScore)          qb.andWhere('ob.emailScore = :emailScore', { emailScore });
+    if (whatsappScore)       qb.andWhere('ob.whatsappScore = :whatsappScore', { whatsappScore });
+    if (sdrScore)            qb.andWhere('ob.sdrScore = :sdrScore', { sdrScore });
+
+    const [data, total] = await qb.skip((page - 1) * limit).take(limit).getManyAndCount();
+
+    const [alto, medio] = await Promise.all([
+      this.outboundRepo.count({ where: { recorteId } }).then(() =>
+        this.outboundRepo.createQueryBuilder().where('recorteId = :recorteId AND outboundScore >= 50', { recorteId }).getCount()
+      ),
+      this.outboundRepo.createQueryBuilder().where('recorteId = :recorteId AND outboundScore >= 20 AND outboundScore < 50', { recorteId }).getCount(),
+    ]);
+
+    return { data, total, alto, medio, inviavel: total - alto - medio };
+  }
+
+  async exportOutbound(recorteId: number): Promise<OutboundEnriquecimento[]> {
+    // Exclui automaticamente CNPJs marcados com DNC no módulo sócio
+    const dncCnpjs = await this.socioRepo.find({
+      where: { recorteId, dnc: true },
+      select: ['cnpj'],
+    });
+    const dncSet = new Set(dncCnpjs.map(r => r.cnpj));
+
+    const all = await this.outboundRepo.find({
+      where: { recorteId },
+      order: { outboundScore: 'DESC' },
+    });
+
+    return all.filter(r => !dncSet.has(r.cnpj));
   }
 
   async getSiteMap(recorteId: number): Promise<Map<string, PresencaDigital>> {

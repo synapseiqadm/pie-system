@@ -6,6 +6,7 @@ import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
 import { AddressEnriquecimento } from './entities/address-enriquecimento.entity';
 import { ContactEnriquecimento } from './entities/contact-enriquecimento.entity';
 import { SocioEnriquecimento } from './entities/socio-enriquecimento.entity';
+import { OutboundEnriquecimento } from './entities/outbound-enriquecimento.entity';
 import { EnrichmentData } from './entities/enrichment-data.entity';
 import { RecortesModule } from '../recortes/recortes.module';
 import { BasePrimariaModule } from '../base-primaria/base-primaria.module';
@@ -13,7 +14,7 @@ import { AiModule } from '../ai/ai.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([SiteEnriquecimento, AddressEnriquecimento, ContactEnriquecimento, SocioEnriquecimento, EnrichmentData]),
+    TypeOrmModule.forFeature([SiteEnriquecimento, AddressEnriquecimento, ContactEnriquecimento, SocioEnriquecimento, OutboundEnriquecimento, EnrichmentData]),
     RecortesModule,
     BasePrimariaModule,
     AiModule,

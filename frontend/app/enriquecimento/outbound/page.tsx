@@ -65,6 +65,7 @@ function OutboundContent() {
   const [total, setTotal]   = useState(0);
   const [page, setPage]     = useState(1);
   const [loading, setLoading] = useState(false);
+  const [fetchError, setFetchError] = useState<string | null>(null);
   const [emailFilter, setEmailFilter] = useState<CanalScore | ''>('');
   const [whatsFilter, setWhatsFilter] = useState<CanalScore | ''>('');
   const [sdrFilter,   setSdrFilter]   = useState<CanalScore | ''>('');
@@ -72,16 +73,21 @@ function OutboundContent() {
   const loadPage = async (p: number, ef = emailFilter, wf = whatsFilter, sf = sdrFilter) => {
     if (!recorteId) return;
     setLoading(true);
+    setFetchError(null);
     try {
       let url = `${API}/enriquecimento/${recorteId}/outbound?page=${p}&limit=50`;
       if (ef)  url += `&emailScore=${ef}`;
       if (wf)  url += `&whatsappScore=${wf}`;
       if (sf)  url += `&sdrScore=${sf}`;
-      const res = await fetch(url).then(r => r.json());
+      const r = await fetch(url);
+      if (!r.ok) { setFetchError(`Erro ${r.status} ao buscar dados outbound`); return; }
+      const res = await r.json();
       setData(res.data ?? []);
       setTotal(res.total ?? 0);
       setStats({ total: res.total ?? 0, alto: res.alto ?? 0, medio: res.medio ?? 0, inviavel: res.inviavel ?? 0 });
       setPage(p);
+    } catch (e: any) {
+      setFetchError(e?.message ?? 'Erro ao conectar ao servidor');
     } finally { setLoading(false); }
   };
 
@@ -228,7 +234,13 @@ function OutboundContent() {
         </>
       )}
 
-      {!loading && data.length === 0 && (
+      {fetchError && (
+        <div style={{ padding: '16px 20px', background: '#fef2f2', border: '1px solid #fca5a5', borderRadius: 8, color: '#dc2626', fontSize: 13, marginBottom: 16 }}>
+          ⚠ {fetchError}
+        </div>
+      )}
+
+      {!loading && !fetchError && data.length === 0 && (
         <div style={{ textAlign: 'center', padding: '48px 0', color: '#9ca3af', fontSize: 14, border: '1px dashed #e5e7eb', borderRadius: 10 }}>
           Nenhum dado outbound. Execute o módulo Outbound-Ready para este recorte.
         </div>

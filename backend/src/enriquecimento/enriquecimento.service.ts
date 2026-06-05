@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { Repository, MoreThanOrEqual, LessThan, Between } from 'typeorm';
 import { RecortesService } from '../recortes/recortes.service';
 import { BigQueryService } from '../base-primaria/bigquery.service';
 import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
@@ -1627,7 +1627,7 @@ export class EnriquecimentoService {
     `);
 
     const total = bqRows.length;
-    if (!total) return { total: 0, direct: 0, third_party: 0, not_found: 0 };
+    if (!total) return { total: 0, alto: 0, medio: 0, inviavel: 0 };
 
     // ── 2. Computar sets de compartilhamento — puro em memória, sem BQ extra ──
     const phoneCount = new Map<string, number>();
@@ -2127,14 +2127,13 @@ export class EnriquecimentoService {
 
     const [data, total] = await qb.skip((page - 1) * limit).take(limit).getManyAndCount();
 
-    const [alto, medio] = await Promise.all([
-      this.outboundRepo.count({ where: { recorteId } }).then(() =>
-        this.outboundRepo.createQueryBuilder().where('recorteId = :recorteId AND outboundScore >= 50', { recorteId }).getCount()
-      ),
-      this.outboundRepo.createQueryBuilder().where('recorteId = :recorteId AND outboundScore >= 20 AND outboundScore < 50', { recorteId }).getCount(),
+    const [alto, medio, totalCount] = await Promise.all([
+      this.outboundRepo.count({ where: { recorteId, outboundScore: MoreThanOrEqual(50) } }),
+      this.outboundRepo.count({ where: { recorteId, outboundScore: Between(20, 49) } }),
+      this.outboundRepo.count({ where: { recorteId } }),
     ]);
 
-    return { data, total, alto, medio, inviavel: total - alto - medio };
+    return { data, total, alto, medio, inviavel: totalCount - alto - medio };
   }
 
   async exportOutbound(recorteId: number): Promise<OutboundEnriquecimento[]> {

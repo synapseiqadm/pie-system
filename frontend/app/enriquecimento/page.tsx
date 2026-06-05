@@ -65,6 +65,7 @@ async function readSseStream(
   if (!reader) return;
   const decoder = new TextDecoder();
   let buf = '';
+  let serverError: string | null = null;
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -74,12 +75,19 @@ async function readSseStream(
       buf = lines.pop() ?? '';
       for (const line of lines) {
         if (!line.startsWith('data:')) continue;
-        try { onEvent(JSON.parse(line.slice(5).trim())); } catch { /* ignore */ }
+        let ev: Record<string, unknown>;
+        try { ev = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (ev.stage === 'erro') {
+          serverError = String(ev.detail ?? 'Erro no servidor');
+        } else {
+          onEvent(ev);
+        }
       }
     }
   } finally {
     reader.cancel().catch(() => {});
   }
+  if (serverError) throw new Error(serverError);
 }
 
 async function runSseEnrichment(

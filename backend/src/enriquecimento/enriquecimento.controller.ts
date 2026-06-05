@@ -137,4 +137,43 @@ export class EnriquecimentoController {
       limit ? Number(limit) : 50,
     );
   }
+
+  // ── Contato PJ ──────────────────────────────────────────────────────────────
+
+  // POST /enriquecimento/:recorteId/contato — processa com SSE progress
+  @Post(':recorteId/contato')
+  async enrichContato(@Param('recorteId') id: string, @Res() res: Response) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    try {
+      const stats = await this.service.enrichContactBatch(
+        Number(id),
+        (done, total, direct, thirdParty) => {
+          sse(res, { stage: 'progresso', done, total, direct, thirdParty });
+        },
+      );
+      sse(res, { stage: 'concluido', ...stats });
+    } catch (err: any) {
+      sse(res, { stage: 'erro', detail: err?.message ?? 'Erro desconhecido' });
+    }
+
+    res.end();
+  }
+
+  // GET /enriquecimento/:recorteId/contato?page=1&limit=50
+  @Get(':recorteId/contato')
+  browseContato(
+    @Param('recorteId') id: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.service.getContactEnriquecimento(
+      Number(id),
+      page ? Number(page) : 1,
+      limit ? Number(limit) : 50,
+    );
+  }
 }

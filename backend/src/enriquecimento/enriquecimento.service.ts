@@ -5,6 +5,7 @@ import { RecortesService } from '../recortes/recortes.service';
 import { BigQueryService } from '../base-primaria/bigquery.service';
 import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
 import { AddressEnriquecimento, AddressStatus } from './entities/address-enriquecimento.entity';
+import { ContactEnriquecimento, ContactQuality } from './entities/contact-enriquecimento.entity';
 import { EnrichmentData, EnrichmentConfidence, EnrichmentSource } from './entities/enrichment-data.entity';
 import { AiService } from '../ai/ai.service';
 
@@ -493,6 +494,139 @@ async function fetchPlacesCascade(
   return best;
 }
 
+// ── Módulo 2 — Contato PJ: helpers ───────────────────────────────────────────
+
+const FREE_EMAIL_DOMAINS = new Set([
+  'gmail.com','hotmail.com','outlook.com','yahoo.com','yahoo.com.br',
+  'bol.com.br','uol.com.br','terra.com.br','ig.com.br','globo.com',
+  'live.com','msn.com','icloud.com',
+]);
+
+const ACCOUNTING_CNAES = new Set(['6920601', '6920602']);
+
+// Shared threshold: telefone/email aparecendo em mais de N CNPJs é suspeito
+const SHARED_THRESHOLD = Number(process.env.CONTACT_SHARED_THRESHOLD ?? '5');
+
+type ContactDetectionResult = {
+  phoneIsThirdParty?: boolean;
+  phoneThirdPartyReason?: string;
+  phoneDirect?: string;
+  phoneDirectSource?: string;
+  emailIsThirdParty?: boolean;
+  emailThirdPartyReason?: string;
+  emailCorporate?: string;
+  emailCorporateSource?: string;
+  contactQuality: ContactQuality;
+};
+
+function detectContact(params: {
+  nome: string;
+  email: string;
+  ddd: string;
+  telefone: string;
+  sharedPhones: Set<string>;
+  sharedEmails: Set<string>;
+  accountingPhones: Set<string>;
+  accountingEmails: Set<string>;
+  placesPhone?: string;
+  whatsappUrl?: string;
+}): ContactDetectionResult {
+  const {
+    nome, email, ddd, telefone,
+    sharedPhones, sharedEmails, accountingPhones, accountingEmails,
+    placesPhone, whatsappUrl,
+  } = params;
+
+  // ── Detecção telefone ───────────────────────────────────────────────────────
+  let phoneIsThirdParty: boolean | undefined;
+  let phoneThirdPartyReason: string | undefined;
+
+  if (ddd && telefone) {
+    const phoneKey = `${ddd.trim()}${telefone.trim()}`;
+    if (sharedPhones.has(phoneKey)) {
+      phoneIsThirdParty   = true;
+      phoneThirdPartyReason = 'shared_multiple_cnpjs';
+    } else if (accountingPhones.has(phoneKey)) {
+      phoneIsThirdParty   = true;
+      phoneThirdPartyReason = 'accounting_cnae';
+    } else {
+      phoneIsThirdParty = false;
+    }
+  }
+
+  // ── Detecção email ──────────────────────────────────────────────────────────
+  let emailIsThirdParty: boolean | undefined;
+  let emailThirdPartyReason: string | undefined;
+  let emailCorporate: string | undefined;
+  let emailCorporateSource: string | undefined;
+
+  if (email?.trim()) {
+    const at = email.lastIndexOf('@');
+    const domain = at > 0 ? email.slice(at + 1).toLowerCase().trim() : '';
+
+    if (!domain) {
+      emailIsThirdParty = undefined; // sem info
+    } else if (FREE_EMAIL_DOMAINS.has(domain)) {
+      emailIsThirdParty   = true;
+      emailThirdPartyReason = 'generic_domain';
+    } else if (sharedEmails.has(email.toLowerCase().trim())) {
+      emailIsThirdParty   = true;
+      emailThirdPartyReason = 'shared_multiple_cnpjs';
+    } else if (accountingEmails.has(email.toLowerCase().trim())) {
+      emailIsThirdParty   = true;
+      emailThirdPartyReason = 'accounting_cnae';
+    } else if (!domainMatchesName(domain, nome)) {
+      emailIsThirdParty   = true;   // suspect — domain sem relação com nome
+      emailThirdPartyReason = 'domain_mismatch';
+    } else {
+      emailIsThirdParty = false;
+      // Domínio próprio → gerar candidatos de email corporativo (não verificados via HTTP)
+      const prefixes = ['contato', 'info', 'fale', 'sac'];
+      emailCorporate       = `${prefixes[0]}@${domain}`;
+      emailCorporateSource = 'rf_domain_pattern';
+    }
+  }
+
+  // ── Busca de contato direto ─────────────────────────────────────────────────
+  let phoneDirect: string | undefined;
+  let phoneDirectSource: string | undefined;
+
+  if (placesPhone && phoneIsThirdParty !== false) {
+    // Places phone disponível e RF phone é suspeito (ou ausente)
+    phoneDirect       = placesPhone;
+    phoneDirectSource = 'places';
+  } else if (phoneIsThirdParty === false && ddd && telefone) {
+    // RF phone é direto — mantém
+    phoneDirect       = `(${ddd.trim()}) ${telefone.trim()}`;
+    phoneDirectSource = 'rf';
+  }
+
+  if (!phoneDirect && whatsappUrl) {
+    // Extrair número do link WhatsApp como fallback
+    const match = whatsappUrl.match(/(\d{10,13})/);
+    if (match) {
+      phoneDirect       = match[1];
+      phoneDirectSource = 'scraping';
+    }
+  }
+
+  // ── contact_quality ─────────────────────────────────────────────────────────
+  let contactQuality: ContactQuality = 'not_found';
+  if (phoneDirect || (emailCorporate && emailIsThirdParty === false)) {
+    contactQuality = 'direct';
+  } else if (phoneIsThirdParty === true || emailIsThirdParty === true) {
+    contactQuality = 'third_party';
+  }
+
+  return {
+    phoneIsThirdParty, phoneThirdPartyReason,
+    phoneDirect, phoneDirectSource,
+    emailIsThirdParty, emailThirdPartyReason,
+    emailCorporate, emailCorporateSource,
+    contactQuality,
+  };
+}
+
 // ── Mapeamento enrichment_data ↔ campos de presença digital ──────────────────
 
 type DigitalFields = {
@@ -555,6 +689,8 @@ export class EnriquecimentoService {
     private readonly siteRepo: Repository<SiteEnriquecimento>,
     @InjectRepository(AddressEnriquecimento)
     private readonly addressRepo: Repository<AddressEnriquecimento>,
+    @InjectRepository(ContactEnriquecimento)
+    private readonly contactRepo: Repository<ContactEnriquecimento>,
     @InjectRepository(EnrichmentData)
     private readonly enrichmentRepo: Repository<EnrichmentData>,
   ) {
@@ -1174,6 +1310,197 @@ export class EnriquecimentoService {
       this.addressRepo.count({ where: { recorteId, status: 'suspeito' } }),
     ]);
     return { data, total, verificado, suspeito, nao_verificado: total - verificado - suspeito };
+  }
+
+  // ── Módulo 2 — Contato PJ ────────────────────────────────────────────────
+
+  async enrichContactBatch(
+    recorteId: number,
+    onProgress: (done: number, total: number, direct: number, thirdParty: number) => void,
+  ): Promise<{ total: number; direct: number; third_party: number; not_found: number }> {
+    const recorte = await this.recortes.findOne(recorteId);
+    const clauses = this.recortes.buildWhere(recorte.filtros);
+    const from    = this.recortes.buildFrom();
+    const { join: empresasJoin } = this.recortes.buildEmpresasJoin();
+    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    // ── 1. Única query BQ: busca dados de contato de todos os CNPJs ───────────
+    const bqRows = await this.bq.query<{
+      cnpj: string; nome: string; email: string;
+      ddd: string; telefone: string; cnae: string;
+    }>(`
+      SELECT
+        TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
+        COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), COALESCE(TRIM(emp.razao_social), '')) AS nome,
+        COALESCE(TRIM(e.correio_eletronico), '')    AS email,
+        COALESCE(TRIM(e.ddd_1), '')                 AS ddd,
+        COALESCE(TRIM(e.telefone_1), '')             AS telefone,
+        COALESCE(TRIM(e.cnae_fiscal_principal), '')  AS cnae
+      FROM ${from}
+      ${empresasJoin}
+      ${where}
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
+    `);
+
+    const total = bqRows.length;
+    if (!total) return { total: 0, direct: 0, third_party: 0, not_found: 0 };
+
+    // ── 2. Computar sets de compartilhamento — puro em memória, sem BQ extra ──
+    const phoneCount = new Map<string, number>();
+    const emailCount = new Map<string, number>();
+    const accountingPhones = new Set<string>();
+    const accountingEmails = new Set<string>();
+
+    for (const r of bqRows) {
+      const phoneKey = `${r.ddd.trim()}${r.telefone.trim()}`;
+      const emailKey = r.email.toLowerCase().trim();
+
+      if (phoneKey.length > 2) phoneCount.set(phoneKey, (phoneCount.get(phoneKey) ?? 0) + 1);
+      if (emailKey)            emailCount.set(emailKey, (emailCount.get(emailKey) ?? 0) + 1);
+
+      if (ACCOUNTING_CNAES.has(r.cnae.replace(/\D/g, ''))) {
+        if (phoneKey.length > 2) accountingPhones.add(phoneKey);
+        if (emailKey)            accountingEmails.add(emailKey);
+      }
+    }
+
+    const sharedPhones = new Set<string>([...phoneCount.entries()]
+      .filter(([, cnt]) => cnt > SHARED_THRESHOLD).map(([k]) => k));
+    const sharedEmails = new Set<string>([...emailCount.entries()]
+      .filter(([, cnt]) => cnt > SHARED_THRESHOLD).map(([k]) => k));
+
+    // ── 3. Bulk read enrichment_data: places_phone (address) + whatsapp (digital)
+    const cnpjList = bqRows.map(r => r.cnpj);
+    const enrichRows = cnpjList.length
+      ? await this.enrichmentRepo
+          .createQueryBuilder('ed')
+          .where('ed.cnpj IN (:...cnpjs)', { cnpjs: cnpjList })
+          .andWhere('ed.module IN (:...modules)', { modules: ['address', 'digital'] })
+          .andWhere('ed.status = :status', { status: 'valid' })
+          .andWhere('ed.field_name IN (:...fields)', { fields: ['places_phone', 'whatsapp_url'] })
+          .getMany()
+      : [];
+
+    const enrichMap = new Map<string, { placesPhone?: string; whatsappUrl?: string }>();
+    for (const r of enrichRows) {
+      const entry = enrichMap.get(r.cnpj) ?? {};
+      if (r.fieldName === 'places_phone')  entry.placesPhone  = r.fieldValue ?? undefined;
+      if (r.fieldName === 'whatsapp_url')  entry.whatsappUrl  = r.fieldValue ?? undefined;
+      enrichMap.set(r.cnpj, entry);
+    }
+
+    // ── 4. Skip CNPJs já processados ─────────────────────────────────────────
+    const done_records = await this.contactRepo.find({
+      where: { recorteId },
+      select: ['cnpj', 'contactQuality'],
+    });
+    const doneSet = new Set(done_records.map(r => r.cnpj));
+    let doneDirect     = done_records.filter(r => r.contactQuality === 'direct').length;
+    let doneThirdParty = done_records.filter(r => r.contactQuality === 'third_party').length;
+    const pending = bqRows.filter(r => !doneSet.has(r.cnpj));
+
+    let done = doneSet.size;
+    if (done > 0) onProgress(done, total, doneDirect, doneThirdParty);
+
+    // ── 5. Detecção pura em memória + gravação em lote ────────────────────────
+    const BATCH = 200;
+    for (let i = 0; i < pending.length; i += BATCH) {
+      const chunk = pending.slice(i, i + BATCH);
+      const contactRecords: ContactEnriquecimento[] = [];
+      const enrichmentRows: object[] = [];
+
+      for (const r of chunk) {
+        const cached = enrichMap.get(r.cnpj) ?? {};
+        const det = detectContact({
+          nome: r.nome, email: r.email, ddd: r.ddd, telefone: r.telefone,
+          sharedPhones, sharedEmails, accountingPhones, accountingEmails,
+          placesPhone: cached.placesPhone,
+          whatsappUrl: cached.whatsappUrl,
+        });
+
+        // Job tracking
+        const cr = this.contactRepo.create({
+          cnpj: r.cnpj, recorteId,
+          phoneIsThirdParty:    det.phoneIsThirdParty,
+          phoneThirdPartyReason: det.phoneThirdPartyReason,
+          phoneDirect:          det.phoneDirect,
+          phoneDirectSource:    det.phoneDirectSource,
+          emailIsThirdParty:    det.emailIsThirdParty,
+          emailThirdPartyReason: det.emailThirdPartyReason,
+          emailCorporate:       det.emailCorporate,
+          emailCorporateSource:  det.emailCorporateSource,
+          contactQuality:       det.contactQuality,
+        });
+        contactRecords.push(cr);
+
+        // enrichment_data rows
+        const fields: Array<{ fieldName: string; fieldValue?: string; source: EnrichmentSource; confidence: EnrichmentConfidence }> = [
+          { fieldName: 'phone_is_third_party',    fieldValue: det.phoneIsThirdParty?.toString(), source: 'rf',      confidence: det.phoneIsThirdParty != null ? 'high' : 'low' },
+          { fieldName: 'phone_third_party_reason', fieldValue: det.phoneThirdPartyReason,         source: 'rf',      confidence: 'high' },
+          { fieldName: 'phone_direct',             fieldValue: det.phoneDirect,                   source: (det.phoneDirectSource ?? 'rf') as EnrichmentSource, confidence: det.phoneDirectSource === 'places' ? 'high' : 'medium' },
+          { fieldName: 'phone_direct_source',      fieldValue: det.phoneDirectSource,             source: 'rf',      confidence: 'high' },
+          { fieldName: 'email_is_third_party',     fieldValue: det.emailIsThirdParty?.toString(), source: 'rf',      confidence: det.emailIsThirdParty != null ? 'high' : 'low' },
+          { fieldName: 'email_third_party_reason', fieldValue: det.emailThirdPartyReason,         source: 'rf',      confidence: 'high' },
+          { fieldName: 'email_corporate',          fieldValue: det.emailCorporate,                source: 'scraping', confidence: 'low' },
+          { fieldName: 'email_corporate_source',   fieldValue: det.emailCorporateSource,          source: 'rf',      confidence: 'high' },
+          { fieldName: 'contact_quality',          fieldValue: det.contactQuality,                source: 'rf',      confidence: 'high' },
+        ];
+
+        for (const f of fields) {
+          enrichmentRows.push({
+            cnpj: r.cnpj, module: 'contact', fieldName: f.fieldName,
+            fieldValue: f.fieldValue ?? undefined,
+            source: f.source, confidence: f.confidence,
+            status: 'valid', enrichedAt: new Date(),
+          });
+        }
+      }
+
+      // Bulk save — TypeORM batches inserts automatically
+      await this.contactRepo.save(contactRecords);
+      await this.enrichmentRepo
+        .createQueryBuilder()
+        .insert()
+        .into(EnrichmentData)
+        .values(enrichmentRows)
+        .orUpdate(
+          ['field_value', 'source', 'confidence', 'enriched_at'],
+          ['cnpj', 'module', 'field_name', 'status'],
+        )
+        .execute();
+
+      done += chunk.length;
+      doneDirect     += contactRecords.filter(r => r.contactQuality === 'direct').length;
+      doneThirdParty += contactRecords.filter(r => r.contactQuality === 'third_party').length;
+      onProgress(done, total, doneDirect, doneThirdParty);
+    }
+
+    const not_found = total - doneDirect - doneThirdParty;
+    return { total, direct: doneDirect, third_party: doneThirdParty, not_found };
+  }
+
+  async getContactEnriquecimento(
+    recorteId: number,
+    page = 1,
+    limit = 50,
+  ): Promise<{
+    data: ContactEnriquecimento[];
+    total: number;
+    direct: number;
+    third_party: number;
+    not_found: number;
+  }> {
+    const [data, total] = await this.contactRepo.findAndCount({
+      where: { recorteId },
+      order: { contactQuality: 'ASC', enriquecidoEm: 'DESC' },
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+    const [direct, third_party] = await Promise.all([
+      this.contactRepo.count({ where: { recorteId, contactQuality: 'direct' } }),
+      this.contactRepo.count({ where: { recorteId, contactQuality: 'third_party' } }),
+    ]);
+    return { data, total, direct, third_party, not_found: total - direct - third_party };
   }
 
   async getSiteMap(recorteId: number): Promise<Map<string, PresencaDigital>> {

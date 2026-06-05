@@ -1627,7 +1627,7 @@ export class EnriquecimentoService {
     `);
 
     const total = bqRows.length;
-    if (!total) return { total: 0, alto: 0, medio: 0, inviavel: 0 };
+    if (!total) return { total: 0, direct: 0, third_party: 0, not_found: 0 };
 
     // ── 2. Computar sets de compartilhamento — puro em memória, sem BQ extra ──
     const phoneCount = new Map<string, number>();

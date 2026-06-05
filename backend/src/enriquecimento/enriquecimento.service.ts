@@ -1,10 +1,10 @@
 import { Injectable, NotFoundException, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository, LessThan } from 'typeorm';
+import { Repository } from 'typeorm';
 import { RecortesService } from '../recortes/recortes.service';
 import { BigQueryService } from '../base-primaria/bigquery.service';
 import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
-import { CnpjSiteCache } from './entities/cnpj-site-cache.entity';
+import { EnrichmentData, EnrichmentConfidence, EnrichmentSource } from './entities/enrichment-data.entity';
 import { AiService } from '../ai/ai.service';
 
 export type TipoTelefone = 'celular' | 'fixo' | 'invalido' | 'sem_telefone';
@@ -29,8 +29,8 @@ export type TelefoneRow = {
   uf: string;
   ddd: string;
   numero: string;
-  telefone_formatado: string;  // (DD) NNNNN-NNNN
-  telefone_e164: string;        // +55DDNNNNNNNNN
+  telefone_formatado: string;
+  telefone_e164: string;
   tipo: TipoTelefone;
 };
 
@@ -40,7 +40,7 @@ export type TelefoneStats = {
   fixo: number;
   invalido: number;
   sem_telefone: number;
-  aproveitamento: number; // % com telefone válido
+  aproveitamento: number;
 };
 
 // DDDs válidos no Brasil
@@ -75,6 +75,31 @@ function formatPhone(ddd: string, numero: string): string {
   return `${d}${n}`;
 }
 
+// ── Pontuação de confiabilidade ───────────────────────────────────────────────
+
+function calcularConfiabilidade(r: {
+  url?: string; googlePhone?: string; googleRating?: number;
+  googleRatingCount?: number; googleBusinessStatus?: string;
+  whatsappUrl?: string; instagramUrl?: string; linkedinUrl?: string;
+  facebookUrl?: string; reclameaquiUrl?: string;
+}): { score: number; label: string } {
+  let score = 0;
+  if (r.url) score += r.googlePhone ? 30 : 15;
+  if (r.googlePhone)  score += 15;
+  if (r.googleRating != null && (r.googleRatingCount ?? 0) >= 5) {
+    score += r.googleRating >= 4 ? 10 : 5;
+  }
+  if (r.googleBusinessStatus === 'OPERATIONAL') score += 5;
+  if (r.whatsappUrl)   score += 15;
+  if (r.instagramUrl)  score += 5;
+  if (r.linkedinUrl)   score += 5;
+  if (r.facebookUrl)   score += 3;
+  if (r.reclameaquiUrl) score += 10;
+  const total = Math.min(100, score);
+  const label = total >= 70 ? 'alto' : total >= 40 ? 'medio' : 'baixo';
+  return { score: total, label };
+}
+
 // ── Site enrichment helpers ──────────────────────────────────────────────────
 
 const LEGAL_SUFFIXES = /\b(ltda|me|mei|epp|s\.?a\.?|cia|eireli|ss|lda|microempresa|micro empresa)\b/gi;
@@ -82,15 +107,13 @@ const GENERIC_WORDS  = /\b(comercio|comercial|servicos|industria|industrias|grou
 
 function domainMatchesName(domain: string, nome: string): boolean {
   if (!nome?.trim() || !domain?.trim()) return false;
-
   const normalize = (s: string) =>
     s.toLowerCase()
-     .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+     .normalize('NFD').replace(/[̀-ͯ]/g, '')
      .replace(/[^a-z0-9]/g, ' ')
      .split(' ').filter(w => w.length > 2);
-
   const nameTokens = normalize(nome);
-  const domainLabel = domain.split('.')[0]; // e.g. "restaurantedomjose" from "restaurantedomjose.com.br"
+  const domainLabel = domain.split('.')[0];
   return nameTokens.some(t => domainLabel.includes(t));
 }
 
@@ -99,10 +122,8 @@ function emailCandidates(email: string, nome: string): string[] {
   const at = email.trim().toLowerCase().lastIndexOf('@');
   if (at < 0) return [];
   const domain = email.trim().toLowerCase().slice(at + 1);
-  // Ignore common free providers — not a company domain
   const FREE = ['gmail.com','hotmail.com','outlook.com','yahoo.com','bol.com.br','uol.com.br','terra.com.br','ig.com.br'];
   if (FREE.includes(domain)) return [];
-  // Ignore third-party domains (accountant, association, etc.) — no name token overlap
   if (!domainMatchesName(domain, nome)) return [];
   return [`https://${domain}`, `https://www.${domain}`];
 }
@@ -111,20 +132,16 @@ function slugCandidates(nome: string): string[] {
   if (!nome?.trim()) return [];
   const base = nome
     .toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')   // strip accents
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
     .replace(LEGAL_SUFFIXES, ' ')
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ').trim();
-
   const words = base.split(' ').filter(w => w.length > 1);
   if (!words.length) return [];
-
   const full     = words.join('');
   const hyphened = words.join('-');
   const short    = words.slice(0, 2).join('');
-
   const slugs = [...new Set([full, short, hyphened].filter(s => s.length >= 3))];
-
   const urls: string[] = [];
   for (const s of slugs) {
     urls.push(`https://${s}.com.br`);
@@ -194,7 +211,6 @@ async function verifyUrl(url: string): Promise<string | null> {
       headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PIE-bot/1.0)' },
     });
     if (res.status < 400) return res.url || url;
-    // Some servers reject HEAD — retry with GET (first byte only)
     const res2 = await fetch(url, {
       method: 'GET',
       signal: ctrl.signal,
@@ -233,14 +249,11 @@ async function fetchPageMeta(url: string): Promise<PageMeta | null> {
     });
     if (res.status >= 400) return null;
     const html = await res.text();
-
     const title = html.match(/<title[^>]*>([^<]{1,200})<\/title>/i)?.[1]?.trim() ?? '';
     const desc  = (
       html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']{0,300})["']/i) ||
       html.match(/<meta[^>]+content=["']([^"']{0,300})["'][^>]+name=["']description["']/i)
     )?.[1]?.trim() ?? '';
-
-    // ── Redes sociais ────────────────────────────────────────────────────────
     const instagramUrl = firstMatch(html,
       /href=["'](https?:\/\/(?:www\.)?instagram\.com\/(?!(?:p|reel|stories|explore|accounts|tv|direct|ar)\/)[a-zA-Z0-9._]{2,30}\/?)['"]/gi,
     );
@@ -253,7 +266,6 @@ async function fetchPageMeta(url: string): Promise<PageMeta | null> {
     const whatsappUrl = firstMatch(html,
       /href=["'](https?:\/\/(?:wa\.me\/\+?[\d]+|api\.whatsapp\.com\/send\?[^"'&]{1,200}|web\.whatsapp\.com\/send\?[^"']{1,200}))['"]/gi,
     );
-
     return { title, description: desc, instagramUrl, facebookUrl, linkedinUrl, whatsappUrl };
   } catch {
     return null;
@@ -266,20 +278,17 @@ async function findReclameAqui(nome: string): Promise<string | null> {
   if (!nome?.trim()) return null;
   const base = nome
     .toLowerCase()
-    .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
     .replace(LEGAL_SUFFIXES, ' ')
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ').trim();
-
   const words = base.split(' ').filter(w => w.length > 1);
   if (!words.length) return null;
-
   const slugs = [...new Set([
     words.join('-'),
     words.slice(0, 3).join('-'),
     words.slice(0, 2).join('-'),
   ].filter(s => s.length >= 3))];
-
   for (const slug of slugs) {
     const url = `https://www.reclameaqui.com.br/empresa/${slug}/`;
     const result = await verifyUrl(url);
@@ -309,11 +318,58 @@ function isBannedUrl(url: string): boolean {
   }
 }
 
+// ── Mapeamento enrichment_data ↔ campos de presença digital ──────────────────
+
+type DigitalFields = {
+  site_url?:              string;
+  site_slug?:             string;
+  instagram_url?:         string;
+  facebook_url?:          string;
+  linkedin_url?:          string;
+  whatsapp_url?:          string;
+  reclameaqui_url?:       string;
+  google_phone?:          string;
+  google_rating?:         string;
+  google_rating_count?:   string;
+  google_business_status?: string;
+  google_address?:        string;
+  confiabilidade_score?:  string;
+  confiabilidade_label?:  string;
+};
+
+function rowsToDigitalFields(rows: EnrichmentData[]): DigitalFields {
+  const fields: DigitalFields = {};
+  for (const r of rows) {
+    if (r.fieldValue != null) {
+      (fields as Record<string, string>)[r.fieldName] = r.fieldValue;
+    }
+  }
+  return fields;
+}
+
+function applyDigitalFields(record: SiteEnriquecimento, fields: DigitalFields): SiteEnriquecimento {
+  record.url                  = fields.site_url;
+  record.slug                 = fields.site_slug;
+  record.instagramUrl         = fields.instagram_url;
+  record.facebookUrl          = fields.facebook_url;
+  record.linkedinUrl          = fields.linkedin_url;
+  record.whatsappUrl          = fields.whatsapp_url;
+  record.reclameaquiUrl       = fields.reclameaqui_url;
+  record.googlePhone          = fields.google_phone;
+  record.googleRating         = fields.google_rating        ? parseFloat(fields.google_rating)      : undefined;
+  record.googleRatingCount    = fields.google_rating_count  ? parseInt(fields.google_rating_count)  : undefined;
+  record.googleBusinessStatus = fields.google_business_status;
+  record.googleAddress        = fields.google_address;
+  record.confiabilidadeScore  = fields.confiabilidade_score ? parseInt(fields.confiabilidade_score) : 0;
+  record.confiabilidadeLabel  = fields.confiabilidade_label ?? 'baixo';
+  record.status               = fields.site_url ? 'encontrado' : 'nao_encontrado';
+  return record;
+}
+
 @Injectable()
 export class EnriquecimentoService {
   private readonly logger = new Logger(EnriquecimentoService.name);
   private readonly googlePlacesKey: string;
-
   private readonly cacheTtlDays: number;
 
   constructor(
@@ -322,8 +378,8 @@ export class EnriquecimentoService {
     private readonly ai: AiService,
     @InjectRepository(SiteEnriquecimento)
     private readonly siteRepo: Repository<SiteEnriquecimento>,
-    @InjectRepository(CnpjSiteCache)
-    private readonly siteCacheRepo: Repository<CnpjSiteCache>,
+    @InjectRepository(EnrichmentData)
+    private readonly enrichmentRepo: Repository<EnrichmentData>,
   ) {
     this.googlePlacesKey = process.env.GOOGLE_PLACES_API_KEY ?? '';
     this.cacheTtlDays    = Number(process.env.SITE_CACHE_TTL_DAYS ?? '30');
@@ -332,7 +388,8 @@ export class EnriquecimentoService {
     }
   }
 
-  // Só stats — rápido, sem paginar dados
+  // ── Telefone ──────────────────────────────────────────────────────────────
+
   async statsTelefone(recorteId: number): Promise<TelefoneStats> {
     const { stats } = await this.enriquecerTelefone(recorteId, 1, 0);
     return stats;
@@ -349,7 +406,6 @@ export class EnriquecimentoService {
     const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
     const offset  = (page - 1) * limit;
 
-    // Query com classificação inline
     const sql = `
       SELECT
         TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
@@ -383,25 +439,19 @@ export class EnriquecimentoService {
         `)
       : [];
 
-    // Montar stats
-    const statsMap = Object.fromEntries(statsRows.map((r) => [r.tipo, Number(r.cnt)]));
-    const celular     = statsMap['celular']     ?? 0;
-    const fixo        = statsMap['fixo']        ?? 0;
-    const invalido    = statsMap['invalido']    ?? 0;
+    const statsMap   = Object.fromEntries(statsRows.map((r) => [r.tipo, Number(r.cnt)]));
+    const celular    = statsMap['celular']     ?? 0;
+    const fixo       = statsMap['fixo']        ?? 0;
+    const invalido   = statsMap['invalido']    ?? 0;
     const sem_telefone = statsMap['sem_telefone'] ?? 0;
-    const total       = celular + fixo + invalido + sem_telefone;
-    const validos     = celular + fixo;
+    const total      = celular + fixo + invalido + sem_telefone;
+    const validos    = celular + fixo;
 
     const stats: TelefoneStats = {
-      total,
-      celular,
-      fixo,
-      invalido,
-      sem_telefone,
+      total, celular, fixo, invalido, sem_telefone,
       aproveitamento: total > 0 ? Math.round((validos / total) * 100) : 0,
     };
 
-    // Formatar rows
     const data: TelefoneRow[] = dataRows.map((r) => ({
       cnpj: r.cnpj,
       nome_fantasia: r.nome_fantasia,
@@ -416,49 +466,73 @@ export class EnriquecimentoService {
     return { stats, data, total: validos };
   }
 
-  // ── Site enrichment ─────────────────────────────────────────────────────────
+  // ── Enrichment data (cache global) ────────────────────────────────────────
 
-  // ── Helpers de cache ────────────────────────────────────────────────────────
+  private async loadDigitalCache(cnpj: string): Promise<EnrichmentData[] | null> {
+    const ttlCutoff = new Date(Date.now() - this.cacheTtlDays * 86_400_000);
+    const rows = await this.enrichmentRepo.find({
+      where: { cnpj, module: 'digital', status: 'valid' },
+    });
+    if (!rows.length) return null;
+    const newest = rows.reduce((a, b) => a.enrichedAt > b.enrichedAt ? a : b);
+    return newest.enrichedAt > ttlCutoff ? rows : null;
+  }
 
-  private applyCache(
+  private async saveDigitalCache(
+    cnpj: string,
     record: SiteEnriquecimento,
-    cached: CnpjSiteCache,
-  ): SiteEnriquecimento {
-    record.status               = cached.status;
-    record.url                  = cached.url;
-    record.slug                 = cached.slug;
-    record.instagramUrl         = cached.instagramUrl;
-    record.facebookUrl          = cached.facebookUrl;
-    record.linkedinUrl          = cached.linkedinUrl;
-    record.whatsappUrl          = cached.whatsappUrl;
-    record.reclameaquiUrl       = cached.reclameaquiUrl;
-    record.googlePhone          = cached.googlePhone;
-    record.googleRating         = cached.googleRating;
-    record.googleRatingCount    = cached.googleRatingCount;
-    record.googleBusinessStatus = cached.googleBusinessStatus;
-    record.googleAddress        = cached.googleAddress;
-    return record;
+    urlSource: EnrichmentSource,
+    urlConfidence: EnrichmentConfidence,
+  ): Promise<void> {
+    type FieldDef = {
+      fieldName: string;
+      fieldValue: string | undefined;
+      source: EnrichmentSource;
+      confidence: EnrichmentConfidence;
+    };
+
+    const fields: FieldDef[] = [
+      { fieldName: 'site_url',              fieldValue: record.url,                             source: urlSource,   confidence: urlConfidence },
+      { fieldName: 'site_slug',             fieldValue: record.slug,                            source: urlSource,   confidence: urlConfidence },
+      { fieldName: 'instagram_url',         fieldValue: record.instagramUrl,                    source: 'scraping',  confidence: urlConfidence },
+      { fieldName: 'facebook_url',          fieldValue: record.facebookUrl,                     source: 'scraping',  confidence: urlConfidence },
+      { fieldName: 'linkedin_url',          fieldValue: record.linkedinUrl,                     source: 'scraping',  confidence: urlConfidence },
+      { fieldName: 'whatsapp_url',          fieldValue: record.whatsappUrl,                     source: 'scraping',  confidence: urlConfidence },
+      { fieldName: 'reclameaqui_url',       fieldValue: record.reclameaquiUrl,                  source: 'scraping',  confidence: 'medium' },
+      { fieldName: 'google_phone',          fieldValue: record.googlePhone,                     source: 'places',    confidence: 'high' },
+      { fieldName: 'google_rating',         fieldValue: record.googleRating?.toString(),        source: 'places',    confidence: 'high' },
+      { fieldName: 'google_rating_count',   fieldValue: record.googleRatingCount?.toString(),   source: 'places',    confidence: 'high' },
+      { fieldName: 'google_business_status', fieldValue: record.googleBusinessStatus,           source: 'places',    confidence: 'high' },
+      { fieldName: 'google_address',        fieldValue: record.googleAddress,                   source: 'places',    confidence: 'high' },
+      { fieldName: 'confiabilidade_score',  fieldValue: record.confiabilidadeScore.toString(),  source: 'scraping',  confidence: 'high' },
+      { fieldName: 'confiabilidade_label',  fieldValue: record.confiabilidadeLabel,             source: 'scraping',  confidence: 'high' },
+    ];
+
+    // Upsert em lote: INSERT ... ON CONFLICT DO UPDATE
+    const rows = fields.map(f => ({
+      cnpj,
+      module:      'digital' as const,
+      fieldName:   f.fieldName,
+      fieldValue:  f.fieldValue ?? null,
+      source:      f.source,
+      confidence:  f.confidence,
+      status:      'valid' as const,
+      enrichedAt:  new Date(),
+    }));
+
+    await this.enrichmentRepo
+      .createQueryBuilder()
+      .insert()
+      .into(EnrichmentData)
+      .values(rows)
+      .orUpdate(
+        ['field_value', 'source', 'confidence', 'enriched_at'],
+        ['cnpj', 'module', 'field_name', 'status'],
+      )
+      .execute();
   }
 
-  private async saveCache(cnpj: string, record: SiteEnriquecimento): Promise<void> {
-    const cached = (await this.siteCacheRepo.findOneBy({ cnpj })) ?? this.siteCacheRepo.create({ cnpj });
-    cached.status               = record.status;
-    cached.url                  = record.url;
-    cached.slug                 = record.slug;
-    cached.instagramUrl         = record.instagramUrl;
-    cached.facebookUrl          = record.facebookUrl;
-    cached.linkedinUrl          = record.linkedinUrl;
-    cached.whatsappUrl          = record.whatsappUrl;
-    cached.reclameaquiUrl       = record.reclameaquiUrl;
-    cached.googlePhone          = record.googlePhone;
-    cached.googleRating         = record.googleRating;
-    cached.googleRatingCount    = record.googleRatingCount;
-    cached.googleBusinessStatus = record.googleBusinessStatus;
-    cached.googleAddress        = record.googleAddress;
-    await this.siteCacheRepo.save(cached);
-  }
-
-  // ── Enriquecimento por linha ─────────────────────────────────────────────────
+  // ── Enriquecimento por linha ──────────────────────────────────────────────
 
   async enrichSiteRow(
     cnpj: string, nome: string, email: string, recorteId: number,
@@ -467,42 +541,54 @@ export class EnriquecimentoService {
     const existing = await this.siteRepo.findOneBy({ cnpj, recorteId });
     const record   = existing ?? this.siteRepo.create({ cnpj, recorteId });
 
-    // ── 1. Cache hit — evita toda chamada externa ──────────────────────────────
-    const ttlCutoff = new Date(Date.now() - this.cacheTtlDays * 86_400_000);
-    const cached = await this.siteCacheRepo.findOneBy({ cnpj });
-    if (cached && cached.cachedAt > ttlCutoff) {
-      return this.siteRepo.save(this.applyCache(record, cached));
+    // ── 1. Cache hit via enrichment_data ─────────────────────────────────────
+    const cachedRows = await this.loadDigitalCache(cnpj);
+    if (cachedRows) {
+      const fields = rowsToDigitalFields(cachedRows);
+      return this.siteRepo.save(applyDigitalFields(record, fields));
     }
 
-    // ── 2. Fase 1: fontes autoritativas (email próprio + Google Places) ────────
-    //    Não requerem validação por IA — confiança alta por definição.
-    const [emailUrls, placesResult, reclameaquiUrl] = await Promise.all([
-      Promise.resolve(emailCandidates(email, nome)),
+    // ── 2. Fase 1: Google Places websiteUri (alta confiança) ─────────────────
+    const [placesResult, reclameaquiUrl, emailUrls] = await Promise.all([
       fetchGooglePlaces(nome, uf, this.googlePlacesKey),
       findReclameAqui(nome),
+      Promise.resolve(emailCandidates(email, nome)),
     ]);
 
-    const phase1Candidates = [
-      ...emailUrls,
-      ...(placesResult?.websiteUri ? [placesResult.websiteUri] : []),
-    ];
+    let found:          string | null = null;
+    let usedSlug        = '';
+    let foundMeta:      PageMeta | null = null;
+    let urlSource:      EnrichmentSource     = 'scraping';
+    let urlConfidence:  EnrichmentConfidence = 'low';
 
-    let found:     string | null = null;
-    let usedSlug   = '';
-    let foundMeta: PageMeta | null = null;
-
-    for (const url of [...new Set(phase1Candidates)]) {
-      if (isBannedUrl(url)) continue;
-      const httpResult = await verifyUrl(url);
-      if (!httpResult || isBannedUrl(httpResult)) continue;
-      foundMeta = await fetchPageMeta(httpResult);
-      found     = httpResult;
-      usedSlug  = url;
-      break; // fonte autoritativa: sem validação de IA
+    // Places websiteUri primeiro — mais autoritativo
+    if (placesResult?.websiteUri && !isBannedUrl(placesResult.websiteUri)) {
+      const httpResult = await verifyUrl(placesResult.websiteUri);
+      if (httpResult && !isBannedUrl(httpResult)) {
+        foundMeta    = await fetchPageMeta(httpResult);
+        found        = httpResult;
+        usedSlug     = placesResult.websiteUri;
+        urlSource    = 'places';
+        urlConfidence = 'high';
+      }
     }
 
-    // ── 3. Fase 2: IA + slug (só se Fase 1 falhou) ────────────────────────────
-    //    Requer validação por IA pois confiança é menor.
+    // Email de domínio próprio — segunda opção autoritativa
+    if (!found) {
+      for (const url of emailUrls) {
+        if (isBannedUrl(url)) continue;
+        const httpResult = await verifyUrl(url);
+        if (!httpResult || isBannedUrl(httpResult)) continue;
+        foundMeta    = await fetchPageMeta(httpResult);
+        found        = httpResult;
+        usedSlug     = url;
+        urlSource    = 'scraping';
+        urlConfidence = 'medium';
+        break;
+      }
+    }
+
+    // ── 3. Fase 2: IA + slug (só se Fase 1 falhou) ───────────────────────────
     if (!found) {
       const [aiDomains, slugUrls] = await Promise.all([
         this.ai.enabled ? this.ai.gerarCandidatosSite(nome, cnae, '', uf) : Promise.resolve([]),
@@ -528,9 +614,10 @@ export class EnriquecimentoService {
           if (!valid) continue;
         }
 
-        found    = httpResult;
-        foundMeta = meta;
-        usedSlug  = url;
+        found        = httpResult;
+        foundMeta    = meta;
+        usedSlug     = url;
+        // urlSource e urlConfidence permanecem 'scraping' / 'low'
         break;
       }
     }
@@ -550,8 +637,12 @@ export class EnriquecimentoService {
     record.googleBusinessStatus = placesResult?.businessStatus;
     record.googleAddress        = placesResult?.address;
 
+    const { score, label } = calcularConfiabilidade(record);
+    record.confiabilidadeScore = score;
+    record.confiabilidadeLabel = label;
+
     const saved = await this.siteRepo.save(record);
-    await this.saveCache(cnpj, saved); // atualiza cache global
+    await this.saveDigitalCache(cnpj, saved, urlSource, urlConfidence);
     return saved;
   }
 
@@ -579,22 +670,19 @@ export class EnriquecimentoService {
     const total = rows.length;
     const CONCURRENCY = 8;
 
-    // Skip CNPJs already processed — allows safe restart without losing work
     const done_records = await this.siteRepo.find({
       where: { recorteId },
       select: ['cnpj', 'status'],
     });
-    const doneSet     = new Set(done_records.map(r => r.cnpj));
-    const doneFound   = done_records.filter(r => r.status === 'encontrado').length;
-    const pending     = rows.filter(r => !doneSet.has(r.cnpj));
+    const doneSet   = new Set(done_records.map(r => r.cnpj));
+    const doneFound = done_records.filter(r => r.status === 'encontrado').length;
+    const pending   = rows.filter(r => !doneSet.has(r.cnpj));
 
-    let done      = doneSet.size;
+    let done       = doneSet.size;
     let encontrado = doneFound;
 
-    // Emit initial progress so UI shows already-completed work immediately
     if (done > 0) onProgress(done, total, encontrado);
 
-    // Process in batches of CONCURRENCY
     for (let i = 0; i < pending.length; i += CONCURRENCY) {
       const batch = pending.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
@@ -624,7 +712,7 @@ export class EnriquecimentoService {
     const ctxMap = new Map<string, { nome: string; uf: string; cnae: string }>();
     try {
       const from = this.recortes.buildFrom();
-      const rows = await this.bq.query<{ cnpj: string; nome: string; uf: string; cnae: string }>(`
+      const bqRows = await this.bq.query<{ cnpj: string; nome: string; uf: string; cnae: string }>(`
         SELECT
           TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
           COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), TRIM(e.cnpj_basico)) AS nome,
@@ -634,9 +722,9 @@ export class EnriquecimentoService {
         WHERE TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) IN (${cnpjs})
         QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
       `);
-      for (const r of rows) ctxMap.set(r.cnpj, { nome: r.nome, uf: r.uf, cnae: r.cnae });
-    } catch (err: any) {
-      this.logger.warn(`revalidarSites: falha ao buscar contexto — ${err?.message}`);
+      for (const r of bqRows) ctxMap.set(r.cnpj, { nome: r.nome, uf: r.uf, cnae: r.cnae });
+    } catch (err: unknown) {
+      this.logger.warn(`revalidarSites: falha ao buscar contexto — ${(err as Error)?.message}`);
     }
 
     const total = records.length;
@@ -650,20 +738,15 @@ export class EnriquecimentoService {
         if (!record.url) return;
 
         if (isBannedUrl(record.url)) {
-          record.status       = 'nao_encontrado';
-          record.url          = undefined;
-          record.slug         = undefined;
-          record.instagramUrl = undefined;
-          record.facebookUrl  = undefined;
-          record.linkedinUrl  = undefined;
-          record.whatsappUrl  = undefined;
+          this.clearSiteRecord(record);
           await this.siteRepo.save(record);
+          await this.invalidateDigitalCache(record.cnpj, 'falso_positivo_digital');
           rejeitados++;
           return;
         }
 
         const meta = await fetchPageMeta(record.url);
-        if (!meta || (!meta.title && !meta.description)) return; // sem conteúdo para validar
+        if (!meta || (!meta.title && !meta.description)) return;
 
         const ctx  = ctxMap.get(record.cnpj);
         const nome = ctx?.nome ?? record.cnpj;
@@ -672,14 +755,9 @@ export class EnriquecimentoService {
           { uf: ctx?.uf, cnae: ctx?.cnae, temWhatsapp: !!meta.whatsappUrl },
         );
         if (!valid) {
-          record.status       = 'nao_encontrado';
-          record.url          = undefined;
-          record.slug         = undefined;
-          record.instagramUrl = undefined;
-          record.facebookUrl  = undefined;
-          record.linkedinUrl  = undefined;
-          record.whatsappUrl  = undefined;
+          this.clearSiteRecord(record);
           await this.siteRepo.save(record);
+          await this.invalidateDigitalCache(record.cnpj, 'falso_positivo_digital');
           rejeitados++;
         } else {
           record.instagramUrl = meta.instagramUrl;
@@ -696,23 +774,48 @@ export class EnriquecimentoService {
     return { total, mantidos: total - rejeitados, rejeitados };
   }
 
+  private clearSiteRecord(record: SiteEnriquecimento): void {
+    record.status       = 'nao_encontrado';
+    record.url          = undefined;
+    record.slug         = undefined;
+    record.instagramUrl = undefined;
+    record.facebookUrl  = undefined;
+    record.linkedinUrl  = undefined;
+    record.whatsappUrl  = undefined;
+  }
+
+  private async invalidateDigitalCache(cnpj: string, reason: string): Promise<void> {
+    await this.enrichmentRepo
+      .createQueryBuilder()
+      .update(EnrichmentData)
+      .set({ status: 'outdated', invalidationReason: reason })
+      .where('cnpj = :cnpj AND module = :module AND status = :status', {
+        cnpj, module: 'digital', status: 'valid',
+      })
+      .execute();
+  }
+
   async getSiteEnriquecimento(
     recorteId: number,
     page = 1,
     limit = 50,
-  ): Promise<{ data: SiteEnriquecimento[]; total: number; encontrado: number }> {
+  ): Promise<{ data: SiteEnriquecimento[]; total: number; encontrado: number; scoreAlto: number; scoreMedio: number; scoreBaixo: number }> {
     const [data, total] = await this.siteRepo.findAndCount({
       where: { recorteId },
-      order: { status: 'ASC', enriquecidoEm: 'DESC' },
+      order: { confiabilidadeScore: 'DESC', enriquecidoEm: 'DESC' },
       skip: (page - 1) * limit,
       take: limit,
     });
-    const encontrado = await this.siteRepo.count({ where: { recorteId, status: 'encontrado' } });
-    return { data, total, encontrado };
+    const [encontrado, scoreAlto, scoreMedio, scoreBaixo] = await Promise.all([
+      this.siteRepo.count({ where: { recorteId, status: 'encontrado' } }),
+      this.siteRepo.count({ where: { recorteId, confiabilidadeLabel: 'alto' } }),
+      this.siteRepo.count({ where: { recorteId, confiabilidadeLabel: 'medio' } }),
+      this.siteRepo.count({ where: { recorteId, confiabilidadeLabel: 'baixo' } }),
+    ]);
+    return { data, total, encontrado, scoreAlto, scoreMedio, scoreBaixo };
   }
 
   async getSiteMap(recorteId: number): Promise<Map<string, PresencaDigital>> {
-    // Include rows without a site URL too — they may have Places data (phone, address, rating)
     const rows = await this.siteRepo.find({
       where: { recorteId },
       select: ['cnpj', 'url', 'instagramUrl', 'facebookUrl', 'linkedinUrl', 'whatsappUrl', 'reclameaquiUrl',

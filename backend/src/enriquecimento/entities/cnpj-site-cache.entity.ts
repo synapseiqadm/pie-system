@@ -50,6 +50,12 @@ export class CnpjSiteCache {
   @Column({ nullable: true })
   googleAddress?: string;
 
+  @Column({ type: 'int', default: 0 })
+  confiabilidadeScore!: number;
+
+  @Column({ default: 'baixo' })
+  confiabilidadeLabel!: string;
+
   @UpdateDateColumn()
   cachedAt!: Date;
 }

@@ -1,6 +1,5 @@
 'use client';
 
-import Image from 'next/image';
 import { FormEvent, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuth } from '../contexts/AuthContext';
@@ -28,64 +27,109 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="relative min-h-screen flex items-center justify-center">
-      {/* background */}
-      <Image
+    <div style={{ position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      {/* background image */}
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
         src="/bg.png"
         alt=""
-        fill
-        priority
-        className="object-cover object-center"
+        style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', zIndex: 0 }}
       />
       {/* overlay */}
-      <div className="absolute inset-0 bg-[#0a0f1e]/60" />
+      <div style={{ position: 'absolute', inset: 0, background: 'rgba(10,15,30,0.62)', zIndex: 1 }} />
 
-      {/* conteúdo */}
-      <div className="relative z-10 w-full max-w-sm flex flex-col gap-6 px-4">
-        <div className="text-center">
-          <span className="text-white font-bold text-3xl tracking-widest">PIE</span>
-          <p className="text-white/50 text-sm mt-1">Plataforma de Inteligência Comercial</p>
+      {/* card */}
+      <div style={{ position: 'relative', zIndex: 2, width: '100%', maxWidth: 380, padding: '0 16px' }}>
+        <div style={{ textAlign: 'center', marginBottom: 24 }}>
+          <div style={{ color: '#fff', fontWeight: 700, fontSize: 28, letterSpacing: 6 }}>PIE</div>
+          <div style={{ color: 'rgba(255,255,255,0.5)', fontSize: 13, marginTop: 4 }}>Plataforma de Inteligência Comercial</div>
         </div>
 
         <form
           onSubmit={handleSubmit}
-          className="bg-white/10 backdrop-blur-md border border-white/20 rounded-2xl px-8 py-8 flex flex-col gap-5 shadow-2xl"
+          style={{
+            background: 'rgba(255,255,255,0.10)',
+            backdropFilter: 'blur(16px)',
+            WebkitBackdropFilter: 'blur(16px)',
+            border: '1px solid rgba(255,255,255,0.18)',
+            borderRadius: 20,
+            padding: '32px 32px',
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 20,
+            boxShadow: '0 8px 40px rgba(0,0,0,0.4)',
+          }}
         >
-          <h1 className="text-white font-semibold text-lg text-center">Entrar na plataforma</h1>
+          <h1 style={{ color: '#fff', fontWeight: 600, fontSize: 17, textAlign: 'center', margin: 0 }}>
+            Entrar na plataforma
+          </h1>
 
-          <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-medium text-white/60 uppercase tracking-wide">Email</label>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{ color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1 }}>
+              Email
+            </label>
             <input
               type="email"
               required
               autoFocus
               value={email}
               onChange={(e) => setEmail(e.target.value)}
-              className="bg-white/10 border border-white/20 rounded-lg px-3 py-2.5 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-400/40 focus:border-cyan-400/60"
               placeholder="seu@email.com"
+              style={{
+                background: 'rgba(255,255,255,0.08)',
+                border: '1px solid rgba(255,255,255,0.18)',
+                borderRadius: 10,
+                padding: '10px 12px',
+                fontSize: 14,
+                color: '#fff',
+                outline: 'none',
+              }}
             />
           </div>
 
-          <div className="flex flex-col gap-1.5">
-            <label className="text-xs font-medium text-white/60 uppercase tracking-wide">Senha</label>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <label style={{ color: 'rgba(255,255,255,0.55)', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: 1 }}>
+              Senha
+            </label>
             <input
               type="password"
               required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="bg-white/10 border border-white/20 rounded-lg px-3 py-2.5 text-sm text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-cyan-400/40 focus:border-cyan-400/60"
               placeholder="••••••••"
+              style={{
+                background: 'rgba(255,255,255,0.08)',
+                border: '1px solid rgba(255,255,255,0.18)',
+                borderRadius: 10,
+                padding: '10px 12px',
+                fontSize: 14,
+                color: '#fff',
+                outline: 'none',
+              }}
             />
           </div>
 
           {error && (
-            <p className="text-red-300 text-sm bg-red-500/20 border border-red-400/30 rounded-lg px-3 py-2">{error}</p>
+            <div style={{ color: '#fca5a5', fontSize: 13, background: 'rgba(239,68,68,0.15)', border: '1px solid rgba(239,68,68,0.3)', borderRadius: 8, padding: '8px 12px' }}>
+              {error}
+            </div>
           )}
 
           <button
             type="submit"
             disabled={loading}
-            className="bg-cyan-500 hover:bg-cyan-400 text-white rounded-lg py-2.5 text-sm font-medium transition-colors disabled:opacity-60 shadow-lg shadow-cyan-500/30"
+            style={{
+              background: loading ? 'rgba(6,182,212,0.5)' : '#06b6d4',
+              color: '#fff',
+              border: 'none',
+              borderRadius: 10,
+              padding: '11px 0',
+              fontSize: 14,
+              fontWeight: 600,
+              cursor: loading ? 'not-allowed' : 'pointer',
+              boxShadow: '0 4px 20px rgba(6,182,212,0.35)',
+              transition: 'background 0.2s',
+            }}
           >
             {loading ? 'Entrando…' : 'Entrar'}
           </button>

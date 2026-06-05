@@ -5,12 +5,7 @@ import { useRouter } from 'next/navigation';
 
 const API = (process.env.NEXT_PUBLIC_API_URL||'https://pie-system-production.up.railway.app');
 
-type Recorte = {
-  id: number;
-  nome: string;
-  descricao?: string;
-  totalCached?: number;
-};
+type Recorte = { id: number; nome: string; descricao?: string; totalCached?: number };
 
 export type JobStatus = 'fila' | 'processando' | 'concluido' | 'erro';
 
@@ -26,19 +21,15 @@ export type Job = {
   progresso?: string;
 };
 
-type EnrichOption = {
-  id: string;
-  label: string;
-  icon: string;
-  available: boolean;
-};
+type EnrichOption = { id: string; label: string; icon: string; available: boolean };
 
-// WhatsApp, Instagram, Facebook e LinkedIn são extraídos automaticamente
-// do HTML do site durante o enriquecimento de Site — não são jobs separados.
 const ENRICHMENTS: EnrichOption[] = [
-  { id: 'socios',   label: 'Sócios',   icon: '👥', available: true },
-  { id: 'telefone', label: 'Telefone', icon: '📞', available: true },
-  { id: 'site',     label: 'Site + Redes Sociais', icon: '🌐', available: true },
+  { id: 'endereco',  label: 'Endereço',        icon: '📍', available: true },
+  { id: 'contato',   label: 'Contato PJ',       icon: '🔍', available: true },
+  { id: 'site',      label: 'Site + Redes',     icon: '🌐', available: true },
+  { id: 'socios',    label: 'Sócios',           icon: '👥', available: true },
+  { id: 'outbound',  label: 'Outbound-Ready',   icon: '🚀', available: true },
+  { id: 'telefone',  label: 'Telefone',         icon: '📞', available: true },
 ];
 
 const COLUMNS: { id: JobStatus; label: string; color: string; bg: string }[] = [
@@ -52,13 +43,16 @@ export const ENRICHMENT_COLORS: Record<string, string> = {
   socios:    '#7c3aed',
   telefone:  '#0891b2',
   site:      '#0070f3',
+  endereco:  '#059669',
+  contato:   '#dc2626',
+  outbound:  '#d97706',
   whatsapp:  '#16a34a',
   instagram: '#e1306c',
   facebook:  '#1877f2',
   linkedin:  '#0a66c2',
 };
 
-// ── SSE stream helper com reconexão automática ────────────────────────────────
+// ── SSE helpers ───────────────────────────────────────────────────────────────
 
 async function readSseStream(
   url: string,
@@ -88,83 +82,68 @@ async function readSseStream(
   }
 }
 
-async function runSiteEnrichment(
+async function runSseEnrichment(
   recorteId: number,
+  endpoint: string,
   onProgress: (msg: string) => void,
+  fmtEvent: (ev: Record<string, unknown>) => string,
+  maxRetries = 3,
 ): Promise<void> {
-  const MAX_RETRIES = 3;
   let attempt = 0;
-  while (attempt < MAX_RETRIES) {
+  while (attempt < maxRetries) {
     try {
-      await readSseStream(
-        `${API}/enriquecimento/${recorteId}/site`,
-        'POST',
-        (ev) => {
-          if (ev.stage === 'progresso') {
-            const done  = ev.done  as number ?? 0;
-            const total = ev.total as number ?? 0;
-            const found = ev.found as number ?? 0;
-            const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-            onProgress(`Site: ${pct}% (${found} encontrados de ${done}/${total})`);
-          }
-        },
-      );
-      return; // concluído com sucesso
+      await readSseStream(`${API}/enriquecimento/${recorteId}/${endpoint}`, 'POST', (ev) => {
+        if (ev.stage === 'progresso') onProgress(fmtEvent(ev));
+      });
+      return;
     } catch (err) {
       attempt++;
-      if (attempt >= MAX_RETRIES) throw err;
-      // Stream caiu — verifica se o backend já terminou antes de reconectar
-      try {
-        const status = await fetch(`${API}/enriquecimento/${recorteId}/site?page=1&limit=1`)
-          .then(r => r.json());
-        if (typeof status.total === 'number' && status.total > 0) return; // já concluído
-      } catch { /* ignora */ }
-      onProgress(`Conexão interrompida — reconectando (tentativa ${attempt}/${MAX_RETRIES})...`);
+      if (attempt >= maxRetries) throw err;
+      onProgress(`Conexão interrompida — reconectando (${attempt}/${maxRetries})...`);
       await new Promise(r => setTimeout(r, 2000 * attempt));
     }
   }
 }
 
-const STORAGE_KEY = 'pie_enrichment_jobs';
+function pct(done: unknown, total: unknown) {
+  const d = Number(done ?? 0), t = Number(total ?? 0);
+  return t > 0 ? Math.round((d / t) * 100) : 0;
+}
 
+// ── Persistência ──────────────────────────────────────────────────────────────
+
+const STORAGE_KEY = 'pie_enrichment_jobs';
 function loadJobs(): Job[] {
   try { return JSON.parse(localStorage.getItem(STORAGE_KEY) ?? '[]'); } catch { return []; }
 }
-function saveJobs(jobs: Job[]) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs));
-}
-
+function saveJobs(jobs: Job[]) { localStorage.setItem(STORAGE_KEY, JSON.stringify(jobs)); }
 function fmt(d: string) {
   return new Date(d).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 }
+
+// ── Componente principal ──────────────────────────────────────────────────────
 
 export default function EnriquecimentoPage() {
   const router = useRouter();
   const [recortes, setRecortes] = useState<Recorte[]>([]);
   const [selected, setSelected] = useState<number | ''>('');
-  const [steps, setSteps]       = useState<Set<string>>(new Set(['socios']));
+  const [steps, setSteps]       = useState<Set<string>>(new Set(['endereco']));
   const [jobs, setJobs]         = useState<Job[]>([]);
 
   useEffect(() => {
     setJobs(loadJobs());
-    fetch(`${API}/recortes`)
-      .then((r) => r.json())
-      .then((d) => setRecortes(Array.isArray(d) ? d : []));
+    fetch(`${API}/recortes`).then(r => r.json()).then(d => setRecortes(Array.isArray(d) ? d : []));
   }, []);
 
   const persist = (updated: Job[]) => { setJobs(updated); saveJobs(updated); };
 
   const toggleStep = (id: string, available: boolean) => {
     if (!available) return;
-    setSteps((prev) => {
-      const next = new Set(prev);
-      next.has(id) ? next.delete(id) : next.add(id);
-      return next;
-    });
+    setSteps(prev => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
   };
 
   const addToQueue = () => {
-    const recorte = recortes.find((r) => r.id === Number(selected));
+    const recorte = recortes.find(r => r.id === Number(selected));
     if (!recorte || steps.size === 0) return;
     persist([{
       id: `${Date.now()}`,
@@ -176,34 +155,27 @@ export default function EnriquecimentoPage() {
       criadoEm: new Date().toISOString(),
     }, ...jobs]);
     setSelected('');
-    setSteps(new Set(['socios']));
+    setSteps(new Set(['endereco']));
   };
 
   const moveJob = (id: string, status: JobStatus, extra?: Partial<Job>) =>
-    persist(jobs.map((j) => j.id === id
+    persist(jobs.map(j => j.id === id
       ? { ...j, status, concluidoEm: status === 'concluido' ? new Date().toISOString() : j.concluidoEm, ...extra }
       : j));
 
-  const removeJob = (id: string) => persist(jobs.filter((j) => j.id !== id));
+  const removeJob = (id: string) => persist(jobs.filter(j => j.id !== id));
 
   const revalidarSite = async (job: Job) => {
     moveJob(job.id, 'processando', { progresso: 'Revalidando sites com IA...' });
     try {
-      await readSseStream(
-        `${API}/enriquecimento/${job.recorteId}/site/revalidar`,
-        'POST',
-        (ev) => {
-          if (ev.stage === 'progresso') {
-            const done      = ev.done      as number ?? 0;
-            const total     = ev.total     as number ?? 0;
-            const rejeitados = ev.rejeitados as number ?? 0;
-            const pct = total > 0 ? Math.round((done / total) * 100) : 0;
-            moveJob(job.id, 'processando', {
-              progresso: `Revalidando: ${pct}% (${rejeitados} rejeitados de ${done}/${total})`,
-            });
-          }
-        },
-      );
+      await readSseStream(`${API}/enriquecimento/${job.recorteId}/site/revalidar`, 'POST', (ev) => {
+        if (ev.stage === 'progresso') {
+          const p = pct(ev.done, ev.total);
+          moveJob(job.id, 'processando', {
+            progresso: `Revalidando: ${p}% (${ev.rejeitados ?? 0} rejeitados de ${ev.done}/${ev.total})`,
+          });
+        }
+      });
       moveJob(job.id, 'concluido');
     } catch (err) {
       moveJob(job.id, 'erro', { progresso: String(err) });
@@ -213,15 +185,48 @@ export default function EnriquecimentoPage() {
   const runJob = async (job: Job) => {
     moveJob(job.id, 'processando', { progresso: 'Iniciando...' });
     try {
-      for (const enrichment of job.enrichments) {
+      // Ordem recomendada: endereço → contato, site, sócios → outbound
+      const ordered = ['endereco', 'telefone', 'site', 'contato', 'socios', 'outbound']
+        .filter(e => job.enrichments.includes(e));
+
+      for (const enrichment of ordered) {
         if (enrichment === 'telefone') {
-          moveJob(job.id, 'processando', { progresso: 'Enriquecendo telefones...' });
+          moveJob(job.id, 'processando', { progresso: 'Classificando telefones...' });
           await fetch(`${API}/enriquecimento/${job.recorteId}/telefone`, { method: 'POST' });
 
         } else if (enrichment === 'site') {
-          moveJob(job.id, 'processando', { progresso: 'Verificando sites (0%)...' });
-          await runSiteEnrichment(job.recorteId, (progresso) =>
-            moveJob(job.id, 'processando', { progresso }),
+          moveJob(job.id, 'processando', { progresso: 'Site: verificando (0%)...' });
+          await runSseEnrichment(job.recorteId, 'site',
+            msg => moveJob(job.id, 'processando', { progresso: msg }),
+            ev => `Site: ${pct(ev.done, ev.total)}% (${ev.found ?? 0} encontrados de ${ev.done}/${ev.total})`,
+          );
+
+        } else if (enrichment === 'endereco') {
+          moveJob(job.id, 'processando', { progresso: 'Endereço: verificando (0%)...' });
+          await runSseEnrichment(job.recorteId, 'endereco',
+            msg => moveJob(job.id, 'processando', { progresso: msg }),
+            ev => `Endereço: ${pct(ev.done, ev.total)}% (${ev.verificado ?? 0} verificados, ${ev.suspeito ?? 0} suspeitos)`,
+          );
+
+        } else if (enrichment === 'contato') {
+          moveJob(job.id, 'processando', { progresso: 'Contato PJ: analisando (0%)...' });
+          await runSseEnrichment(job.recorteId, 'contato',
+            msg => moveJob(job.id, 'processando', { progresso: msg }),
+            ev => `Contato: ${pct(ev.done, ev.total)}% (${ev.direct ?? 0} diretos, ${ev.thirdParty ?? 0} terceiros)`,
+          );
+
+        } else if (enrichment === 'socios') {
+          moveJob(job.id, 'processando', { progresso: 'Sócios: processando (0%)...' });
+          await runSseEnrichment(job.recorteId, 'socio',
+            msg => moveJob(job.id, 'processando', { progresso: msg }),
+            ev => `Sócios: ${pct(ev.done, ev.total)}% (${ev.comCandidate ?? 0} com email candidato)`,
+          );
+
+        } else if (enrichment === 'outbound') {
+          moveJob(job.id, 'processando', { progresso: 'Outbound: consolidando (0%)...' });
+          await runSseEnrichment(job.recorteId, 'outbound',
+            msg => moveJob(job.id, 'processando', { progresso: msg }),
+            ev => `Outbound: ${pct(ev.done, ev.total)}% consolidado`,
           );
         }
       }
@@ -232,23 +237,21 @@ export default function EnriquecimentoPage() {
     }
   };
 
-  const usarEmCampanha = (job: Job) => {
-    router.push(`/campanhas?jobId=${job.id}`);
-  };
+  const navResult = (path: string, job: Job) =>
+    router.push(`/enriquecimento/${path}?recorteId=${job.recorteId}&nome=${encodeURIComponent(job.recorteNome)}`);
 
-  const byStatus = (s: JobStatus) => jobs.filter((j) => j.status === s);
+  const byStatus = (s: JobStatus) => jobs.filter(j => j.status === s);
   const canAdd = selected !== '' && steps.size > 0;
 
   return (
     <main style={{ padding: 32, fontFamily: 'sans-serif', maxWidth: 1200, margin: '0 auto' }}>
 
-      {/* ── Fluxo ── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 20 }}>
-        <FlowStep label="Recortes" href="/recortes" active={false} />
+        <FlowStep label="Recortes"      href="/recortes"      active={false} />
         <FlowArrow />
         <FlowStep label="Enriquecimento" href="/enriquecimento" active={true} />
         <FlowArrow />
-        <FlowStep label="Campanhas" href="/campanhas" active={false} />
+        <FlowStep label="Campanhas"     href="/campanhas"     active={false} />
       </div>
 
       <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Enriquecimento</h1>
@@ -260,39 +263,30 @@ export default function EnriquecimentoPage() {
       <div style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 10, padding: '20px 24px', marginBottom: 28, display: 'flex', gap: 20, flexWrap: 'wrap', alignItems: 'flex-end' }}>
         <div style={{ flex: '1 1 220px' }}>
           <label style={labelStyle}>Recorte</label>
-          <select
-            value={selected}
-            onChange={(e) => setSelected(e.target.value === '' ? '' : Number(e.target.value))}
-            style={selectStyle}
-          >
+          <select value={selected} onChange={e => setSelected(e.target.value === '' ? '' : Number(e.target.value))} style={selectStyle}>
             <option value="">Selecionar...</option>
-            {recortes.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.nome}{r.totalCached != null ? ` · ${r.totalCached.toLocaleString('pt-BR')} reg.` : ''}
-              </option>
+            {recortes.map(r => (
+              <option key={r.id} value={r.id}>{r.nome}{r.totalCached != null ? ` · ${r.totalCached.toLocaleString('pt-BR')} reg.` : ''}</option>
             ))}
           </select>
         </div>
 
-        <div style={{ flex: '2 1 320px' }}>
-          <label style={labelStyle}>Enriquecimentos</label>
-          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            {ENRICHMENTS.map((e) => {
+        <div style={{ flex: '2 1 400px' }}>
+          <label style={labelStyle}>Módulos</label>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            {ENRICHMENTS.map(e => {
               const on = steps.has(e.id) && e.available;
               return (
                 <button key={e.id} onClick={() => toggleStep(e.id, e.available)}
-                  title={!e.available ? 'Em desenvolvimento' : undefined}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 5,
-                    padding: '6px 12px', borderRadius: 99, fontSize: 12, fontWeight: 500,
+                    padding: '5px 11px', borderRadius: 99, fontSize: 12, fontWeight: 500,
                     cursor: e.available ? 'pointer' : 'not-allowed',
                     border: `1.5px solid ${on ? ENRICHMENT_COLORS[e.id] : '#e5e7eb'}`,
                     background: on ? `${ENRICHMENT_COLORS[e.id]}18` : '#f9fafb',
-                    color: on ? ENRICHMENT_COLORS[e.id] : e.available ? '#374151' : '#9ca3af',
-                    opacity: e.available ? 1 : 0.5,
+                    color: on ? ENRICHMENT_COLORS[e.id] : '#374151',
                   }}>
                   {e.icon} {e.label}
-                  {!e.available && <span style={{ fontSize: 9, color: '#9ca3af' }}>· breve</span>}
                 </button>
               );
             })}
@@ -316,36 +310,30 @@ export default function EnriquecimentoPage() {
         </div>
       ) : (
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12 }}>
-          {COLUMNS.map((col) => (
+          {COLUMNS.map(col => (
             <div key={col.id} style={{ background: col.bg, border: `1px solid ${col.color}22`, borderRadius: 10, padding: 12, minHeight: 200 }}>
               <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
-                <span style={{ fontSize: 12, fontWeight: 700, color: col.color, textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                  {col.label}
-                </span>
-                <span style={{ fontSize: 11, background: `${col.color}22`, color: col.color, borderRadius: 99, padding: '1px 7px', fontWeight: 600 }}>
-                  {byStatus(col.id).length}
-                </span>
+                <span style={{ fontSize: 12, fontWeight: 700, color: col.color, textTransform: 'uppercase', letterSpacing: '0.05em' }}>{col.label}</span>
+                <span style={{ fontSize: 11, background: `${col.color}22`, color: col.color, borderRadius: 99, padding: '1px 7px', fontWeight: 600 }}>{byStatus(col.id).length}</span>
               </div>
 
               <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                {byStatus(col.id).map((job) => (
+                {byStatus(col.id).map(job => (
                   <div key={job.id} style={{ background: '#fff', border: '1px solid #e5e7eb', borderRadius: 8, padding: '12px 14px', boxShadow: '0 1px 3px rgba(0,0,0,0.06)' }}>
                     <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4, color: '#111' }}>{job.recorteNome}</div>
                     {job.totalRegistros != null && (
-                      <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 8 }}>
-                        {job.totalRegistros.toLocaleString('pt-BR')} registros
-                      </div>
+                      <div style={{ fontSize: 11, color: '#6b7280', marginBottom: 8 }}>{job.totalRegistros.toLocaleString('pt-BR')} registros</div>
                     )}
                     <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginBottom: 10 }}>
-                      {job.enrichments.map((e) => {
-                        const opt = ENRICHMENTS.find((o) => o.id === e);
+                      {job.enrichments.map(e => {
+                        const opt = ENRICHMENTS.find(o => o.id === e);
                         return (
                           <span key={e} style={{
                             fontSize: 11, padding: '2px 7px', borderRadius: 99,
                             background: `${ENRICHMENT_COLORS[e] ?? '#6b7280'}18`,
                             color: ENRICHMENT_COLORS[e] ?? '#6b7280', fontWeight: 500,
                           }}>
-                            {opt?.icon} {opt?.label}
+                            {opt?.icon} {opt?.label ?? e}
                           </span>
                         );
                       })}
@@ -365,32 +353,48 @@ export default function EnriquecimentoPage() {
                         </>
                       )}
                       {col.id === 'processando' && (
-                        <>
-                          <ActionBtn color="#6b7280" onClick={() => moveJob(job.id, 'erro')}>✕ Cancelar</ActionBtn>
-                        </>
+                        <ActionBtn color="#6b7280" onClick={() => moveJob(job.id, 'erro')}>✕ Cancelar</ActionBtn>
                       )}
                       {col.id === 'concluido' && (
                         <>
-                          {job.enrichments.includes('telefone') && (
-                            <button
-                              onClick={() => router.push(`/enriquecimento/telefone?recorteId=${job.recorteId}&nome=${encodeURIComponent(job.recorteNome)}`)}
-                              style={{ width: '100%', padding: '5px 0', borderRadius: 7, fontSize: 11, fontWeight: 600, background: '#f0fdf4', color: '#16a34a', border: '1px solid #bbf7d0', cursor: 'pointer', marginBottom: 4 }}
-                            >
-                              📞 Ver Telefones
-                            </button>
+                          {job.enrichments.includes('endereco') && (
+                            <ResultBtn color={ENRICHMENT_COLORS.endereco} onClick={() => navResult('endereco', job)}>
+                              📍 Ver Endereços
+                            </ResultBtn>
+                          )}
+                          {job.enrichments.includes('contato') && (
+                            <ResultBtn color={ENRICHMENT_COLORS.contato} onClick={() => navResult('contato', job)}>
+                              🔍 Ver Contatos
+                            </ResultBtn>
                           )}
                           {job.enrichments.includes('site') && (
-                            <button
-                              onClick={() => revalidarSite(job)}
-                              style={{ width: '100%', padding: '5px 0', borderRadius: 7, fontSize: 11, fontWeight: 600, background: '#fdf4ff', color: '#7e22ce', border: '1px solid #e9d5ff', cursor: 'pointer', marginBottom: 4 }}
-                            >
-                              ✨ Revalidar sites com IA
-                            </button>
+                            <>
+                              <ResultBtn color={ENRICHMENT_COLORS.site} onClick={() => navResult('site', job)}>
+                                🌐 Ver Sites
+                              </ResultBtn>
+                              <ResultBtn color="#7e22ce" onClick={() => revalidarSite(job)}>
+                                ✨ Revalidar IA
+                              </ResultBtn>
+                            </>
                           )}
-                          <button onClick={() => usarEmCampanha(job)} style={{
+                          {job.enrichments.includes('socios') && (
+                            <ResultBtn color={ENRICHMENT_COLORS.socios} onClick={() => navResult('socios', job)}>
+                              👥 Ver Sócios
+                            </ResultBtn>
+                          )}
+                          {job.enrichments.includes('telefone') && (
+                            <ResultBtn color={ENRICHMENT_COLORS.telefone} onClick={() => navResult('telefone', job)}>
+                              📞 Ver Telefones
+                            </ResultBtn>
+                          )}
+                          {job.enrichments.includes('outbound') && (
+                            <ResultBtn color={ENRICHMENT_COLORS.outbound} onClick={() => navResult('outbound', job)}>
+                              🚀 Ver Outbound
+                            </ResultBtn>
+                          )}
+                          <button onClick={() => router.push(`/campanhas?jobId=${job.id}`)} style={{
                             width: '100%', padding: '6px 0', borderRadius: 7, fontSize: 12, fontWeight: 700,
-                            background: '#0070f3', color: '#fff', border: 'none', cursor: 'pointer',
-                            marginBottom: 4,
+                            background: '#0070f3', color: '#fff', border: 'none', cursor: 'pointer', marginTop: 2,
                           }}>
                             Usar em Campanha →
                           </button>
@@ -418,30 +422,30 @@ export default function EnriquecimentoPage() {
 function FlowStep({ label, href, active }: { label: string; href: string; active: boolean }) {
   return (
     <a href={href} style={{
-      padding: '5px 14px', borderRadius: 99, fontSize: 12, fontWeight: 600,
-      textDecoration: 'none',
+      padding: '5px 14px', borderRadius: 99, fontSize: 12, fontWeight: 600, textDecoration: 'none',
       background: active ? '#0070f3' : '#f3f4f6',
       color: active ? '#fff' : '#6b7280',
       border: `1.5px solid ${active ? '#0070f3' : '#e5e7eb'}`,
-    }}>
-      {label}
-    </a>
+    }}>{label}</a>
   );
 }
-
-function FlowArrow() {
-  return <span style={{ color: '#d1d5db', fontSize: 16 }}>→</span>;
-}
+function FlowArrow() { return <span style={{ color: '#d1d5db', fontSize: 16 }}>→</span>; }
 
 function ActionBtn({ children, color, onClick }: { children: React.ReactNode; color: string; onClick: () => void }) {
   return (
     <button onClick={onClick} style={{
       fontSize: 11, fontWeight: 600, padding: '3px 10px', borderRadius: 6,
-      border: `1px solid ${color}44`, background: `${color}12`,
-      color, cursor: 'pointer',
-    }}>
-      {children}
-    </button>
+      border: `1px solid ${color}44`, background: `${color}12`, color, cursor: 'pointer',
+    }}>{children}</button>
+  );
+}
+
+function ResultBtn({ children, color, onClick }: { children: React.ReactNode; color: string; onClick: () => void }) {
+  return (
+    <button onClick={onClick} style={{
+      width: '100%', padding: '5px 0', borderRadius: 7, fontSize: 11, fontWeight: 600,
+      background: `${color}12`, color, border: `1px solid ${color}44`, cursor: 'pointer', marginBottom: 3,
+    }}>{children}</button>
   );
 }
 

@@ -234,6 +234,7 @@ type PageMeta = {
   facebookUrl?: string;
   linkedinUrl?: string;
   whatsappUrl?: string;
+  extractedPhones?: string[];  // números BR normalizados (só dígitos) encontrados na página
 };
 
 function firstMatch(html: string, re: RegExp): string | undefined {
@@ -268,7 +269,14 @@ async function fetchPageMeta(url: string): Promise<PageMeta | null> {
     const whatsappUrl = firstMatch(html,
       /href=["'](https?:\/\/(?:wa\.me\/\+?[\d]+|api\.whatsapp\.com\/send\?[^"'&]{1,200}|web\.whatsapp\.com\/send\?[^"']{1,200}))['"]/gi,
     );
-    return { title, description: desc, instagramUrl, facebookUrl, linkedinUrl, whatsappUrl };
+    // Extrair telefones BR da página (normalizado — só dígitos, 10-11 chars com DDD)
+    const phoneRe = /(?:\+55[\s-]?)?(?:\(?\d{2}\)?[\s-]?)(\d{4,5}[\s-]?\d{4})/g;
+    const phonesRaw = html.match(phoneRe) ?? [];
+    const extractedPhones = [...new Set(
+      phonesRaw.map(p => p.replace(/\D/g, '')).filter(p => p.length >= 10 && p.length <= 13),
+    )];
+
+    return { title, description: desc, instagramUrl, facebookUrl, linkedinUrl, whatsappUrl, extractedPhones };
   } catch {
     return null;
   } finally {
@@ -297,6 +305,51 @@ async function findReclameAqui(nome: string): Promise<string | null> {
     if (result) return result;
   }
   return null;
+}
+
+// ── Módulo 3 — score multi-âncora (validação de site Fase 2) ─────────────────
+
+const UFS_BR = new Set([
+  'AC','AL','AP','AM','BA','CE','DF','ES','GO','MA','MT','MS',
+  'MG','PA','PB','PR','PE','PI','RJ','RN','RS','RO','RR','SC','SP','SE','TO',
+]);
+
+function calcSiteAnchorScore(
+  meta: PageMeta,
+  rfDdd: string,
+  rfTelefone: string,
+  rfUf: string,
+  placesPhone?: string,
+): number {
+  let score = 0;
+
+  // Âncora telefone (30pts) — compara sufixo de 8 dígitos
+  const rfNorm = `${rfDdd.trim()}${rfTelefone.trim()}`.replace(/\D/g, '');
+  const plNorm = (placesPhone ?? '').replace(/\D/g, '');
+  const suffix = 8;
+
+  if (rfNorm.length >= suffix || plNorm.length >= suffix) {
+    for (const p of meta.extractedPhones ?? []) {
+      if (
+        (rfNorm.length >= suffix && p.endsWith(rfNorm.slice(-suffix))) ||
+        (plNorm.length >= suffix && p.endsWith(plNorm.slice(-suffix)))
+      ) {
+        score += 30;
+        break;
+      }
+    }
+  }
+
+  // Âncora UF (20pts) — UF mencionada no título ou descrição
+  const text = `${meta.title} ${meta.description}`.toUpperCase();
+  if (rfUf && UFS_BR.has(rfUf.toUpperCase())) {
+    // Verifica como palavra isolada (evita falsos positivos tipo "SP" dentro de "ISPO")
+    if (new RegExp(`\\b${rfUf.toUpperCase()}\\b`).test(text)) {
+      score += 20;
+    }
+  }
+
+  return score;
 }
 
 const BANNED_HOSTS = new Set([
@@ -644,6 +697,7 @@ type DigitalFields = {
   google_address?:        string;
   confiabilidade_score?:  string;
   confiabilidade_label?:  string;
+  site_anchor_score?:     string;
 };
 
 function rowsToDigitalFields(rows: EnrichmentData[]): DigitalFields {
@@ -796,6 +850,7 @@ export class EnriquecimentoService {
     record: SiteEnriquecimento,
     urlSource: EnrichmentSource,
     urlConfidence: EnrichmentConfidence,
+    anchorScore = 0,
   ): Promise<void> {
     type FieldDef = {
       fieldName: string;
@@ -819,6 +874,7 @@ export class EnriquecimentoService {
       { fieldName: 'google_address',        fieldValue: record.googleAddress,                   source: 'places',    confidence: 'high' },
       { fieldName: 'confiabilidade_score',  fieldValue: record.confiabilidadeScore.toString(),  source: 'scraping',  confidence: 'high' },
       { fieldName: 'confiabilidade_label',  fieldValue: record.confiabilidadeLabel,             source: 'scraping',  confidence: 'high' },
+      { fieldName: 'site_anchor_score',     fieldValue: anchorScore.toString(),                 source: 'scraping',  confidence: 'high' },
     ];
 
     // Upsert em lote: INSERT ... ON CONFLICT DO UPDATE
@@ -849,7 +905,7 @@ export class EnriquecimentoService {
 
   async enrichSiteRow(
     cnpj: string, nome: string, email: string, recorteId: number,
-    cnae = '', uf = '',
+    cnae = '', uf = '', ddd = '', telefone = '',
   ): Promise<SiteEnriquecimento> {
     const existing = await this.siteRepo.findOneBy({ cnpj, recorteId });
     const record   = existing ?? this.siteRepo.create({ cnpj, recorteId });
@@ -873,6 +929,7 @@ export class EnriquecimentoService {
     let foundMeta:      PageMeta | null = null;
     let urlSource:      EnrichmentSource     = 'scraping';
     let urlConfidence:  EnrichmentConfidence = 'low';
+    let siteAnchorScore = 0;
 
     // Places websiteUri primeiro — mais autoritativo
     if (placesResult?.websiteUri && !isBannedUrl(placesResult.websiteUri)) {
@@ -927,10 +984,17 @@ export class EnriquecimentoService {
           if (!valid) continue;
         }
 
-        found        = httpResult;
-        foundMeta    = meta;
-        usedSlug     = url;
-        // urlSource e urlConfidence permanecem 'scraping' / 'low'
+        // Score multi-âncora — telefone (30pts) + UF (20pts)
+        const anchorScore = meta
+          ? calcSiteAnchorScore(meta, ddd, telefone, uf, placesResult?.phone)
+          : 0;
+
+        found           = httpResult;
+        foundMeta       = meta;
+        usedSlug        = url;
+        siteAnchorScore = anchorScore;
+        // Fase 2 com âncora confirmada → medium; só IA → low
+        urlConfidence   = anchorScore > 0 ? 'medium' : 'low';
         break;
       }
     }
@@ -955,7 +1019,7 @@ export class EnriquecimentoService {
     record.confiabilidadeLabel = label;
 
     const saved = await this.siteRepo.save(record);
-    await this.saveDigitalCache(cnpj, saved, urlSource, urlConfidence);
+    await this.saveDigitalCache(cnpj, saved, urlSource, urlConfidence, siteAnchorScore);
     return saved;
   }
 
@@ -968,13 +1032,15 @@ export class EnriquecimentoService {
     const from    = this.recortes.buildFrom();
     const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-    const rows = await this.bq.query<{ cnpj: string; nome: string; email: string; cnae: string; uf: string }>(`
+    const rows = await this.bq.query<{ cnpj: string; nome: string; email: string; cnae: string; uf: string; ddd: string; telefone: string }>(`
       SELECT
         TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv) AS cnpj,
         COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), TRIM(e.cnpj_basico)) AS nome,
         COALESCE(TRIM(e.correio_eletronico), '') AS email,
         COALESCE(TRIM(e.cnae_fiscal_principal), '') AS cnae,
-        COALESCE(TRIM(e.uf), '') AS uf
+        COALESCE(TRIM(e.uf), '') AS uf,
+        COALESCE(TRIM(e.ddd_1), '') AS ddd,
+        COALESCE(TRIM(e.telefone_1), '') AS telefone
       FROM ${from}
       ${where}
       QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
@@ -999,7 +1065,7 @@ export class EnriquecimentoService {
     for (let i = 0; i < pending.length; i += CONCURRENCY) {
       const batch = pending.slice(i, i + CONCURRENCY);
       const results = await Promise.all(
-        batch.map(r => this.enrichSiteRow(r.cnpj, r.nome, r.email, recorteId, r.cnae, r.uf)),
+        batch.map(r => this.enrichSiteRow(r.cnpj, r.nome, r.email, recorteId, r.cnae, r.uf, r.ddd, r.telefone)),
       );
       done += batch.length;
       encontrado += results.filter(r => r.status === 'encontrado').length;

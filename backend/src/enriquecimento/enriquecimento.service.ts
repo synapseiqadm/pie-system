@@ -513,7 +513,7 @@ export class EnriquecimentoService {
       cnpj,
       module:      'digital' as const,
       fieldName:   f.fieldName,
-      fieldValue:  f.fieldValue ?? null,
+      fieldValue:  f.fieldValue ?? undefined,
       source:      f.source,
       confidence:  f.confidence,
       status:      'valid' as const,

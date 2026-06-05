@@ -98,4 +98,43 @@ export class EnriquecimentoController {
     const map = await this.service.getSiteMap(Number(id));
     return Object.fromEntries(map);
   }
+
+  // ── Endereço ────────────────────────────────────────────────────────────────
+
+  // POST /enriquecimento/:recorteId/endereco — processa com SSE progress
+  @Post(':recorteId/endereco')
+  async enrichEndereco(@Param('recorteId') id: string, @Res() res: Response) {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    try {
+      const stats = await this.service.enrichAddressBatch(
+        Number(id),
+        (done, total, verificado, suspeito) => {
+          sse(res, { stage: 'progresso', done, total, verificado, suspeito });
+        },
+      );
+      sse(res, { stage: 'concluido', ...stats });
+    } catch (err: any) {
+      sse(res, { stage: 'erro', detail: err?.message ?? 'Erro desconhecido' });
+    }
+
+    res.end();
+  }
+
+  // GET /enriquecimento/:recorteId/endereco?page=1&limit=50
+  @Get(':recorteId/endereco')
+  browseEndereco(
+    @Param('recorteId') id: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.service.getAddressEnriquecimento(
+      Number(id),
+      page ? Number(page) : 1,
+      limit ? Number(limit) : 50,
+    );
+  }
 }

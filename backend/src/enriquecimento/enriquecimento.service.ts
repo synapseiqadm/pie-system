@@ -4,6 +4,7 @@ import { Repository } from 'typeorm';
 import { RecortesService } from '../recortes/recortes.service';
 import { BigQueryService } from '../base-primaria/bigquery.service';
 import { SiteEnriquecimento } from './entities/site-enriquecimento.entity';
+import { AddressEnriquecimento, AddressStatus } from './entities/address-enriquecimento.entity';
 import { EnrichmentData, EnrichmentConfidence, EnrichmentSource } from './entities/enrichment-data.entity';
 import { AiService } from '../ai/ai.service';
 
@@ -318,6 +319,180 @@ function isBannedUrl(url: string): boolean {
   }
 }
 
+// ── Módulo 1 — Endereço: helpers ─────────────────────────────────────────────
+
+type PlacesAddressResult = PlacesResult & {
+  placeName?: string;
+  primaryType?: string;
+  hasHours?: boolean;
+};
+
+const ADDR_ABBREV: Record<string, string> = {
+  'r.': 'rua', 'av.': 'avenida', 'av ': 'avenida ', 'al.': 'alameda',
+  'pca': 'praca', 'pça': 'praca', 'trav.': 'travessa', 'rod.': 'rodovia',
+  'est.': 'estrada', 'blvd': 'boulevard',
+};
+
+function normalizeAddr(s: string): string {
+  if (!s) return '';
+  let out = s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[.,\-/]/g, ' ');
+  for (const [abbr, full] of Object.entries(ADDR_ABBREV)) out = out.replace(new RegExp(abbr, 'g'), full);
+  return out.replace(/\s+/g, ' ').trim();
+}
+
+function tokenOverlap(a: string, b: string, minLen = 3): number {
+  const tokA = new Set(a.split(' ').filter(w => w.length >= minLen));
+  const tokB = new Set(b.split(' ').filter(w => w.length >= minLen));
+  if (!tokA.size || !tokB.size) return 0;
+  let common = 0;
+  for (const t of tokA) if (tokB.has(t)) common++;
+  return common / Math.min(tokA.size, tokB.size);
+}
+
+function normalizePhone(s: string): string {
+  return (s ?? '').replace(/\D/g, '');
+}
+
+// CNAE division (2 dígitos) → tipos compatíveis no Places primaryType
+const CNAE_PLACES_MAP: Record<string, string[]> = {
+  '10': ['bakery', 'food_producer'],
+  '47': ['store', 'clothing_store', 'electronics_store', 'hardware_store',
+         'supermarket', 'convenience_store', 'shopping_mall', 'home_goods_store'],
+  '45': ['car_repair', 'car_dealer', 'gas_station'],
+  '46': ['wholesaler'],
+  '55': ['hotel', 'lodging', 'motel'],
+  '56': ['restaurant', 'cafe', 'bakery', 'bar', 'meal_delivery', 'meal_takeaway'],
+  '64': ['bank', 'atm'],
+  '65': ['insurance_agency'],
+  '68': ['real_estate_agency'],
+  '69': ['lawyer', 'accounting'],
+  '77': ['car_rental'],
+  '82': ['school'],
+  '85': ['school', 'university', 'primary_school', 'secondary_school'],
+  '86': ['hospital', 'pharmacy', 'doctor', 'dentist', 'physiotherapist'],
+  '87': ['nursing_home'],
+  '93': ['gym', 'sports_club', 'bowling_alley'],
+  '96': ['beauty_salon', 'hair_care', 'spa', 'nail_salon'],
+};
+
+function scoreEndereco(rfAddr: string, placesAddr: string): number {
+  const overlap = tokenOverlap(normalizeAddr(rfAddr), normalizeAddr(placesAddr));
+  return Math.round(overlap * 40);
+}
+
+function scoreTelefone(rfDdd: string, rfTel: string, placesPhone: string): number {
+  if (!placesPhone || !rfDdd || !rfTel) return 0;
+  const rf = normalizePhone(`${rfDdd}${rfTel}`);
+  const pl = normalizePhone(placesPhone);
+  if (!rf || !pl) return 0;
+  // Compara sufixo (DDD pode estar ausente no Places)
+  const shorter = rf.length < pl.length ? rf : pl;
+  const longer  = rf.length < pl.length ? pl : rf;
+  return longer.endsWith(shorter) ? 30 : 0;
+}
+
+function scoreCnae(cnae: string, primaryType: string): number {
+  if (!cnae || !primaryType) return 0;
+  const div = cnae.slice(0, 2);
+  const compat = CNAE_PLACES_MAP[div] ?? [];
+  return compat.includes(primaryType) ? 20 : 0;
+}
+
+function scoreNome(rfNome: string, placesName: string): number {
+  if (!rfNome || !placesName) return 0;
+  const normalize = (s: string) =>
+    s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z0-9 ]/g, ' ');
+  const overlap = tokenOverlap(normalize(rfNome), normalize(placesName), 2);
+  return overlap >= 0.7 ? 10 : Math.round(overlap * 10);
+}
+
+function calcMatchScore(
+  rf: { addr: string; ddd: string; tel: string; nome: string; cnae: string },
+  pl: PlacesAddressResult,
+): number {
+  return (
+    scoreEndereco(rf.addr, pl.address ?? '') +
+    scoreTelefone(rf.ddd, rf.tel, pl.phone ?? '') +
+    scoreCnae(rf.cnae, pl.primaryType ?? '') +
+    scoreNome(rf.nome, pl.placeName ?? '')
+  );
+}
+
+async function fetchPlacesForAddress(
+  query: string, apiKey: string,
+): Promise<PlacesAddressResult | null> {
+  if (!apiKey?.trim()) return null;
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8_000);
+  try {
+    const res = await fetch('https://places.googleapis.com/v1/places:searchText', {
+      method: 'POST',
+      signal: ctrl.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': apiKey,
+        'X-Goog-FieldMask': [
+          'places.displayName',
+          'places.formattedAddress',
+          'places.nationalPhoneNumber',
+          'places.websiteUri',
+          'places.rating',
+          'places.userRatingCount',
+          'places.businessStatus',
+          'places.primaryType',
+          'places.regularOpeningHours',
+        ].join(','),
+      },
+      body: JSON.stringify({
+        textQuery: query,
+        languageCode: 'pt-BR',
+        maxResultCount: 1,
+        regionCode: 'BR',
+      }),
+    });
+    if (!res.ok) return null;
+    const data: { places?: Record<string, unknown>[] } = await res.json();
+    const place = data.places?.[0];
+    if (!place) return null;
+    const displayName = place['displayName'] as Record<string, string> | undefined;
+    const hours       = place['regularOpeningHours'] as Record<string, unknown> | undefined;
+    return {
+      placeName:      displayName?.['text'],
+      address:        place['formattedAddress']        as string | undefined,
+      phone:          place['nationalPhoneNumber']     as string | undefined,
+      websiteUri:     place['websiteUri']              as string | undefined,
+      rating:         place['rating']                  as number | undefined,
+      ratingCount:    place['userRatingCount']         as number | undefined,
+      businessStatus: place['businessStatus']          as string | undefined,
+      primaryType:    place['primaryType']             as string | undefined,
+      hasHours:       hours != null,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchPlacesCascade(
+  queries: string[],
+  rf: { addr: string; ddd: string; tel: string; nome: string; cnae: string },
+  apiKey: string,
+): Promise<{ result: PlacesAddressResult; score: number } | null> {
+  let best: { result: PlacesAddressResult; score: number } | null = null;
+
+  for (const query of queries) {
+    const result = await fetchPlacesForAddress(query, apiKey);
+    if (!result) continue;
+
+    const score = calcMatchScore(rf, result);
+    if (!best || score > best.score) best = { result, score };
+    if (score >= 70) break;   // match alto: não precisa tentar próxima query
+  }
+
+  return best;
+}
+
 // ── Mapeamento enrichment_data ↔ campos de presença digital ──────────────────
 
 type DigitalFields = {
@@ -378,6 +553,8 @@ export class EnriquecimentoService {
     private readonly ai: AiService,
     @InjectRepository(SiteEnriquecimento)
     private readonly siteRepo: Repository<SiteEnriquecimento>,
+    @InjectRepository(AddressEnriquecimento)
+    private readonly addressRepo: Repository<AddressEnriquecimento>,
     @InjectRepository(EnrichmentData)
     private readonly enrichmentRepo: Repository<EnrichmentData>,
   ) {
@@ -813,6 +990,190 @@ export class EnriquecimentoService {
       this.siteRepo.count({ where: { recorteId, confiabilidadeLabel: 'baixo' } }),
     ]);
     return { data, total, encontrado, scoreAlto, scoreMedio, scoreBaixo };
+  }
+
+  // ── Módulo 1 — Endereço ──────────────────────────────────────────────────
+
+  async enrichAddressRow(input: {
+    cnpj: string; recorteId: number;
+    nomeFantasia: string; razaoSocial: string;
+    tipoLogradouro: string; logradouro: string; numero: string;
+    uf: string; ddd: string; telefone: string; cnae: string;
+  }): Promise<AddressEnriquecimento> {
+    const existing = await this.addressRepo.findOneBy({ cnpj: input.cnpj, recorteId: input.recorteId });
+    const record   = existing ?? this.addressRepo.create({ cnpj: input.cnpj, recorteId: input.recorteId });
+
+    // Cache hit — já enriquecido neste recorte
+    if (existing) return existing;
+
+    if (!this.googlePlacesKey) {
+      record.status = 'nao_verificado';
+      record.confidence = 'unverified';
+      return this.addressRepo.save(record);
+    }
+
+    const rfAddr  = `${input.tipoLogradouro} ${input.logradouro} ${input.numero}`.trim();
+    const rfInput = { addr: rfAddr, ddd: input.ddd, tel: input.telefone, nome: input.nomeFantasia, cnae: input.cnae };
+
+    const queries = [
+      `${input.nomeFantasia} ${rfAddr} ${input.uf} Brasil`,
+      input.razaoSocial ? `${input.razaoSocial} ${rfAddr} ${input.uf} Brasil` : '',
+      `${rfAddr} ${input.uf} Brasil`,
+    ].filter(Boolean);
+
+    const best = await fetchPlacesCascade(queries, rfInput, this.googlePlacesKey);
+
+    // Determinar status e confidence pelo score
+    let status:     AddressStatus       = 'nao_verificado';
+    let confidence: EnrichmentConfidence = 'unverified';
+    if (best) {
+      if (best.score >= 70) { status = 'verificado';   confidence = 'high'; }
+      else if (best.score >= 40) { status = 'suspeito'; confidence = 'medium'; }
+      else                       { status = 'suspeito'; confidence = 'low'; }
+    }
+
+    // Preencher record de job tracking
+    record.status            = status;
+    record.matchScore        = best?.score ?? 0;
+    record.confidence        = confidence;
+    record.businessStatus    = best?.result.businessStatus;
+    record.placesAddress     = best?.result.address;
+    record.placesPhone       = best?.result.phone;
+    record.placesRating      = best?.result.rating;
+    record.placesReviewsCount = best?.result.ratingCount;
+    record.placesHasHours    = best?.result.hasHours;
+
+    const saved = await this.addressRepo.save(record);
+
+    // Gravar campos detalhados em enrichment_data (module='address')
+    const pl = best?.result;
+    const addressFields: Array<{ fieldName: string; fieldValue: string | undefined; source: EnrichmentSource; confidence: EnrichmentConfidence }> = [
+      { fieldName: 'address_verified',      fieldValue: status === 'verificado' ? 'true' : status === 'suspeito' ? 'suspect' : 'false', source: 'places', confidence },
+      { fieldName: 'address_match_score',   fieldValue: String(best?.score ?? 0),  source: 'places', confidence },
+      { fieldName: 'business_status',       fieldValue: pl?.businessStatus,         source: 'places', confidence: 'high' },
+      { fieldName: 'address_places',        fieldValue: pl?.address,               source: 'places', confidence },
+      { fieldName: 'places_phone',          fieldValue: pl?.phone,                 source: 'places', confidence: 'high' },
+      { fieldName: 'places_rating',         fieldValue: pl?.rating?.toString(),    source: 'places', confidence: 'high' },
+      { fieldName: 'places_reviews_count',  fieldValue: pl?.ratingCount?.toString(), source: 'places', confidence: 'high' },
+      { fieldName: 'places_has_hours',      fieldValue: pl?.hasHours?.toString(),  source: 'places', confidence: 'high' },
+      { fieldName: 'places_website_uri',    fieldValue: pl?.websiteUri,            source: 'places', confidence: 'high' },
+      { fieldName: 'places_primary_type',   fieldValue: pl?.primaryType,           source: 'places', confidence: 'high' },
+    ];
+
+    const rows = addressFields.map(f => ({
+      cnpj:       input.cnpj,
+      module:     'address' as const,
+      fieldName:  f.fieldName,
+      fieldValue: f.fieldValue ?? undefined,
+      source:     f.source,
+      confidence: f.confidence,
+      status:     'valid' as const,
+      enrichedAt: new Date(),
+    }));
+
+    await this.enrichmentRepo
+      .createQueryBuilder()
+      .insert()
+      .into(EnrichmentData)
+      .values(rows)
+      .orUpdate(
+        ['field_value', 'source', 'confidence', 'enriched_at'],
+        ['cnpj', 'module', 'field_name', 'status'],
+      )
+      .execute();
+
+    return saved;
+  }
+
+  async enrichAddressBatch(
+    recorteId: number,
+    onProgress: (done: number, total: number, verificado: number, suspeito: number) => void,
+  ): Promise<{ total: number; verificado: number; suspeito: number; nao_verificado: number }> {
+    const recorte = await this.recortes.findOne(recorteId);
+    const clauses = this.recortes.buildWhere(recorte.filtros);
+    const from    = this.recortes.buildFrom();
+    const { join: empresasJoin } = this.recortes.buildEmpresasJoin();
+    const where   = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+    const rows = await this.bq.query<{
+      cnpj: string; nome_fantasia: string; razao_social: string;
+      tipo_logradouro: string; logradouro: string; numero: string;
+      uf: string; ddd: string; telefone: string; cnae: string;
+    }>(`
+      SELECT
+        TRIM(e.cnpj_basico) || TRIM(e.cnpj_ordem) || TRIM(e.cnpj_dv)   AS cnpj,
+        COALESCE(NULLIF(TRIM(e.nome_fantasia), ''), '')                  AS nome_fantasia,
+        COALESCE(TRIM(emp.razao_social), '')                             AS razao_social,
+        COALESCE(TRIM(e.tipo_logradouro), '')                            AS tipo_logradouro,
+        COALESCE(TRIM(e.logradouro), '')                                 AS logradouro,
+        COALESCE(TRIM(e.numero), '')                                     AS numero,
+        COALESCE(TRIM(e.uf), '')                                         AS uf,
+        COALESCE(TRIM(e.ddd_1), '')                                      AS ddd,
+        COALESCE(TRIM(e.telefone_1), '')                                 AS telefone,
+        COALESCE(TRIM(e.cnae_fiscal_principal), '')                      AS cnae
+      FROM ${from}
+      ${empresasJoin}
+      ${where}
+      QUALIFY ROW_NUMBER() OVER (PARTITION BY e.cnpj_basico, e.cnpj_ordem, e.cnpj_dv ORDER BY e.cnpj_basico) = 1
+    `);
+
+    const total = rows.length;
+    const CONCURRENCY = 6;
+
+    const done_records = await this.addressRepo.find({
+      where: { recorteId },
+      select: ['cnpj', 'status'],
+    });
+    const doneSet       = new Set(done_records.map(r => r.cnpj));
+    let doneVerificado  = done_records.filter(r => r.status === 'verificado').length;
+    let doneSuspeito    = done_records.filter(r => r.status === 'suspeito').length;
+    const pending       = rows.filter(r => !doneSet.has(r.cnpj));
+
+    let done = doneSet.size;
+    if (done > 0) onProgress(done, total, doneVerificado, doneSuspeito);
+
+    for (let i = 0; i < pending.length; i += CONCURRENCY) {
+      const batch = pending.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(
+        batch.map(r => this.enrichAddressRow({
+          cnpj: r.cnpj, recorteId,
+          nomeFantasia: r.nome_fantasia, razaoSocial: r.razao_social,
+          tipoLogradouro: r.tipo_logradouro, logradouro: r.logradouro, numero: r.numero,
+          uf: r.uf, ddd: r.ddd, telefone: r.telefone, cnae: r.cnae,
+        })),
+      );
+      done += batch.length;
+      doneVerificado += results.filter(r => r.status === 'verificado').length;
+      doneSuspeito   += results.filter(r => r.status === 'suspeito').length;
+      onProgress(done, total, doneVerificado, doneSuspeito);
+    }
+
+    const nao_verificado = total - doneVerificado - doneSuspeito;
+    return { total, verificado: doneVerificado, suspeito: doneSuspeito, nao_verificado };
+  }
+
+  async getAddressEnriquecimento(
+    recorteId: number,
+    page = 1,
+    limit = 50,
+  ): Promise<{
+    data: AddressEnriquecimento[];
+    total: number;
+    verificado: number;
+    suspeito: number;
+    nao_verificado: number;
+  }> {
+    const [data, total] = await this.addressRepo.findAndCount({
+      where: { recorteId },
+      order: { matchScore: 'DESC', enriquecidoEm: 'DESC' },
+      skip: (page - 1) * limit,
+      take: limit,
+    });
+    const [verificado, suspeito] = await Promise.all([
+      this.addressRepo.count({ where: { recorteId, status: 'verificado' } }),
+      this.addressRepo.count({ where: { recorteId, status: 'suspeito' } }),
+    ]);
+    return { data, total, verificado, suspeito, nao_verificado: total - verificado - suspeito };
   }
 
   async getSiteMap(recorteId: number): Promise<Map<string, PresencaDigital>> {

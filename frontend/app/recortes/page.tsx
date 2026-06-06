@@ -533,7 +533,18 @@ export default function SegmentosPage() {
     } finally { setLoadingAnalise(null); }
   }
 
-  function exportar(id: number) { window.open(`${API}/recortes/${id}/exportar`, '_blank'); }
+  async function exportar(id: number) {
+    const token = localStorage.getItem('pie_token');
+    const res = await fetch(`${API}/recortes/${id}/exportar`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) { alert('Erro ao exportar'); return; }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `recorte-${id}.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }
 
   // ─── Render ───────────────────────────────────────────────────────────────
 
